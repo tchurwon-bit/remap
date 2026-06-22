@@ -3875,6 +3875,7 @@ function drawScene(){if(state.settings){resizeCanvas();}const hasMaze=(state.map
 function renderHud(){const me=state.myPlayer;const teamMode=state.settings&&state.settings.game_mode==='team';const statusText=state.gameStatus==='running'?(me&&me.state==='battling'?'배틀 중':'이동 중'):state.gameStatus==='countdown'?'시작 준비':state.gameStatus==='finished'?'게임 종료':'준비 중';const rank=state.rankings.find(r=>r.player_id===state.playerId)?.rank||'-';topInfo.innerHTML=`<div class="statHero"><span class="mini">${escapeHtml(state.roomTitle||'ReMap')}</span><strong>${escapeHtml(me?me.nickname:'-')}</strong></div>${teamMode?`<div class="rankItem"><span>팀</span><strong>${escapeHtml(me&&me.team?me.team+'팀':'-')}</strong></div>`:''}<div class="rankItem"><span>점수</span><strong>${Number(me?me.score:0)}</strong></div><div class="rankItem"><span>현재 순위</span><strong>${escapeHtml(rank)}위</strong></div><div class="rankItem"><span>남은 시간</span><strong>${formatTime(state.remainingTime)}</strong></div><div class="rankItem"><span>상태</span><strong>${escapeHtml(statusText)}</strong></div>`;rankingList.innerHTML=state.rankings.length?state.rankings.map(r=>`<div class="rankItem"><span>${Number(r.rank)||'-'}. ${escapeHtml(r.nickname)}${teamMode&&r.team?` <span class=\"mini\">(${escapeHtml(r.team)})</span>`:''}</span><strong>${Number(r.score||0)}</strong></div>`).join(''):'<div class="mini">대기 중</div>';teamRankingList.innerHTML=teamMode?(state.teamRankings.length?state.teamRankings.map(r=>`<div class="rankItem"><span>${Number(r.rank)||'-'}. ${escapeHtml(r.team)}팀</span><strong>${Number(r.score||0)}</strong></div>`).join(''):'<div class="mini">팀 정보 없음</div>'):'<div class="mini">개인전 모드</div>';battleList.innerHTML=state.battles.length?state.battles.map(b=>`<div class="battleItem"><span>${(b.players||[]).map(escapeHtml).join(' vs ')}</span><strong>${Number(b.progress||0)}/${Number(b.total||0)}</strong></div>`).join(''):'<div class="mini">진행 중인 배틀 없음</div>';logList.innerHTML=state.logs.length?state.logs.slice().reverse().map(l=>`<div class="logItem"><span>${escapeHtml(l.time)}</span><span>${escapeHtml(l.message)}</span></div>`).join(''):'<div class="mini">아직 배틀 기록이 없습니다.</div>';}
 function render(){drawScene();renderHud();}
 function drawGrid(hasMaze=false){ctx.strokeStyle=hasMaze?'rgba(37,99,235,0.06)':'rgba(37,99,235,0.08)';for(let x=0;x<canvas.width;x+=50){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,canvas.height);ctx.stroke()}for(let y=0;y<canvas.height;y+=50){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(canvas.width,y);ctx.stroke()}}
+
 function drawWalls(walls){(walls||[]).forEach(w=>{const radius=Math.min(14,Math.min(w.w,w.h)*0.22);const g=ctx.createLinearGradient(w.x,w.y,w.x+w.w,w.y+w.h);g.addColorStop(0,'#7fb6ef');g.addColorStop(.55,'#5d8fda');g.addColorStop(1,'#4d78c6');ctx.save();ctx.shadowColor='rgba(59,130,246,0.18)';ctx.shadowBlur=8;ctx.shadowOffsetY=3;ctx.fillStyle=g;roundRect(w.x,w.y,w.w,w.h,radius,true,false);ctx.restore();ctx.strokeStyle='rgba(255,255,255,.42)';ctx.lineWidth=2;roundRect(w.x,w.y,w.w,w.h,radius,false,true);ctx.fillStyle='rgba(255,255,255,.16)';roundRect(w.x+4,w.y+4,Math.max(8,w.w-8),Math.max(6,Math.min(w.h*0.24,16)),Math.max(4,radius*0.5),true,false);});ctx.lineWidth=1;}
 function hexToRgb(hex){const clean=(hex||'#60a5fa').replace('#','');const normalized=clean.length===3?clean.split('').map(c=>c+c).join(''):clean;const n=parseInt(normalized,16);return {r:(n>>16)&255,g:(n>>8)&255,b:n&255};}
 function darkenColor(hex, factor=0.22){const {r,g,b}=hexToRgb(hex);return `rgb(${Math.max(0,Math.floor(r*(1-factor)))},${Math.max(0,Math.floor(g*(1-factor)))},${Math.max(0,Math.floor(b*(1-factor)))})`;}
@@ -5072,7 +5073,7 @@ function connectTeacherSocket(){
   syncModeUI();
   syncMapUI();
   resizeCanvas(settings);
-  renderMap(msg);
+  scheduleTeacherMapRender(msg);
   if(room.code && room.code!==teacherRoomCode){setTeacherRoomCode(room.code);}
 };
   ws.onclose=()=>{if(teacherWs===ws){teacherWs=null;}};
@@ -5087,7 +5088,7 @@ document.getElementById('newRoomBtn').onclick=async()=>{const btn=document.getEl
 document.getElementById('clearBgLiveBtn').onclick=()=>fetch(teacherApi('/api/teacher/clear_background'),{method:'POST'});
 
 connectTeacherSocket();
-function resizeCanvas(settings){const w=Number(settings.map_width)||1060;const h=Number(settings.map_height)||612;if(canvas.width!==w)canvas.width=w;if(canvas.height!==h)canvas.height=h;if(settings.background_data_url){if(!bgImage||bgImage.src!==settings.background_data_url){const img=new Image();img.onload=()=>currentState&&renderMap(currentState);img.src=settings.background_data_url;bgImage=img;}}else{bgImage=null;}}
+function resizeCanvas(settings){const w=Number(settings.map_width)||1060;const h=Number(settings.map_height)||612;if(canvas.width!==w)canvas.width=w;if(canvas.height!==h)canvas.height=h;if(settings.background_data_url){if(!bgImage||bgImage.src!==settings.background_data_url){const img=new Image();img.onload=()=>currentState&&scheduleTeacherMapRender(currentState);img.src=settings.background_data_url;bgImage=img;}}else{bgImage=null;}}
 function buildTeacherEndPayload(){const msg=currentState||{};const players=(msg.players||[]).slice().sort((a,b)=>(Number(b.score||0)-Number(a.score||0))||(Number(b.correct_count||0)-Number(a.correct_count||0))||String(a.nickname||'').localeCompare(String(b.nickname||'')));const best=players.slice().sort((a,b)=>(Number(b.correct_count||0)-Number(a.correct_count||0))||(Number(a.answer_count||0)-Number(b.answer_count||0))||String(a.nickname||'').localeCompare(String(b.nickname||'')))[0]||null;const most=players.slice().sort((a,b)=>(Number(b.battles_played||0)-Number(a.battles_played||0))||(Number(b.correct_count||0)-Number(a.correct_count||0))||String(a.nickname||'').localeCompare(String(b.nickname||'')))[0]||null;return {rankings:msg.rankings||players.map((p,i)=>({...p,rank:i+1})),team_rankings:msg.team_rankings||[],logs:msg.student_logs||msg.logs||[],player_stats:players.map(p=>({nickname:p.nickname,team:p.team,score:p.score,correct_count:p.correct_count,answer_count:p.answer_count,battles_played:p.battles_played,color:p.color})),best_correct:best?{nickname:best.nickname,correct_count:best.correct_count}:null,most_battles:most?{nickname:most.nickname,battles_played:most.battles_played}:null,winner_team:(msg.team_rankings&&msg.team_rankings[0])||null};}
 let teacherCeremonyWindow=null;
 function openTeacherCeremony(){
@@ -5104,13 +5105,85 @@ function openTeacherCeremony(){
 }
 const ceremonyBtnEl=document.getElementById('ceremonyBtn');
 if(ceremonyBtnEl){ceremonyBtnEl.onclick=openTeacherCeremony;}
+
+/* ===== v3.37 teacher monitoring smooth render patch =====
+   교사 화면은 서버 수신 주기와 별도로 requestAnimationFrame으로 부드럽게 보간합니다.
+   서버 메시지 빈도를 다시 높이지 않고도 학생 캐릭터가 끊겨 보이는 느낌을 줄입니다. */
+let teacherMapMsg=null;
+let teacherRenderLoopOn=false;
+let teacherLastFrameTime=0;
+const teacherPlayerDisplay=new Map();
+function copyTeacherMsgForDraw(msg){
+  if(!msg)return null;
+  const cloned=Object.assign({}, msg);
+  cloned.players=(msg.players||[]).map(p=>Object.assign({}, p));
+  cloned.map_walls=msg.map_walls||[];
+  return cloned;
+}
+function updateTeacherSmoothTargets(msg){
+  const now=performance.now();
+  const alive=new Set();
+  (msg.players||[]).forEach(p=>{
+    const id=String(p.id||p.nickname||'');
+    if(!id)return;
+    alive.add(id);
+    let d=teacherPlayerDisplay.get(id);
+    const tx=Number(p.x)||0, ty=Number(p.y)||0;
+    if(!d){
+      d={x:tx,y:ty,targetX:tx,targetY:ty,lastSeen:now,raw:p};
+      teacherPlayerDisplay.set(id,d);
+    }else{
+      const jump=Math.hypot(tx-d.x, ty-d.y);
+      d.targetX=tx;d.targetY=ty;d.lastSeen=now;d.raw=p;
+      if(jump>220 || !Number.isFinite(jump)){d.x=tx;d.y=ty;}
+    }
+  });
+  for(const [id,d] of teacherPlayerDisplay.entries()){
+    if(!alive.has(id) || now-d.lastSeen>4000){teacherPlayerDisplay.delete(id);}
+  }
+}
+function scheduleTeacherMapRender(msg){
+  teacherMapMsg=msg;
+  updateTeacherSmoothTargets(msg);
+  if(!teacherRenderLoopOn){
+    teacherRenderLoopOn=true;
+    teacherLastFrameTime=performance.now();
+    requestAnimationFrame(teacherSmoothRenderFrame);
+  }
+}
+function teacherSmoothRenderFrame(now){
+  if(!teacherMapMsg){teacherRenderLoopOn=false;return;}
+  const dt=Math.min(50, Math.max(0, now-teacherLastFrameTime || 16));
+  teacherLastFrameTime=now;
+  const alpha=1-Math.pow(0.001, dt/180); // 약 0.18초 안에 목표 지점으로 자연스럽게 접근
+  for(const d of teacherPlayerDisplay.values()){
+    d.x += (d.targetX-d.x)*alpha;
+    d.y += (d.targetY-d.y)*alpha;
+  }
+  const drawMsg=copyTeacherMsgForDraw(teacherMapMsg);
+  if(drawMsg){
+    drawMsg.players=(teacherMapMsg.players||[]).map(p=>{
+      const id=String(p.id||p.nickname||'');
+      const d=teacherPlayerDisplay.get(id);
+      return d?Object.assign({},p,{x:d.x,y:d.y}):p;
+    });
+    renderMap(drawMsg);
+  }
+  const visible=operateScreen&&operateScreen.style.display!=='none';
+  if(visible && teacherMapMsg && ['running','countdown','lobby'].includes((currentState&&currentState.game_status)||'lobby')){
+    requestAnimationFrame(teacherSmoothRenderFrame);
+  }else{
+    teacherRenderLoopOn=false;
+  }
+}
+
 function drawWalls(walls){(walls||[]).forEach(w=>{const radius=Math.min(14,Math.min(w.w,w.h)*0.22);const g=ctx.createLinearGradient(w.x,w.y,w.x+w.w,w.y+w.h);g.addColorStop(0,'#7fb6ef');g.addColorStop(.55,'#5d8fda');g.addColorStop(1,'#4d78c6');ctx.save();ctx.shadowColor='rgba(59,130,246,0.18)';ctx.shadowBlur=8;ctx.shadowOffsetY=3;ctx.fillStyle=g;roundRect(w.x,w.y,w.w,w.h,radius,true,false);ctx.restore();ctx.strokeStyle='rgba(255,255,255,.42)';ctx.lineWidth=2;roundRect(w.x,w.y,w.w,w.h,radius,false,true);ctx.fillStyle='rgba(255,255,255,.16)';roundRect(w.x+4,w.y+4,Math.max(8,w.w-8),Math.max(6,Math.min(w.h*0.24,16)),Math.max(4,radius*0.5),true,false);});ctx.lineWidth=1;}
 function renderMap(msg){ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,canvas.width,canvas.height);const hasMaze=(msg.map_walls||[]).length>0;if(bgImage&&bgImage.complete){ctx.drawImage(bgImage,0,0,canvas.width,canvas.height)}else{const bg=ctx.createLinearGradient(0,0,canvas.width,canvas.height);bg.addColorStop(0,'#eaf2ff');bg.addColorStop(.55,'#dbeafe');bg.addColorStop(1,'#cfe2ff');ctx.fillStyle=bg;ctx.fillRect(0,0,canvas.width,canvas.height);ctx.fillStyle='rgba(255,255,255,.30)';ctx.fillRect(14,14,canvas.width-28,canvas.height-28)}ctx.strokeStyle=hasMaze?'rgba(37,99,235,0.08)':'rgba(37,99,235,0.09)';for(let x=0;x<canvas.width;x+=50){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,canvas.height);ctx.stroke()}for(let y=0;y<canvas.height;y+=50){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(canvas.width,y);ctx.stroke()}drawWalls(msg.map_walls||[]);(msg.players||[]).forEach(p=>{try{drawPlayer(p)}catch(e){console.warn('teacher drawPlayer failed',e,p);}})}
 function hexToRgb(hex){const clean=(hex||'#60a5fa').replace('#','');const normalized=clean.length===3?clean.split('').map(c=>c+c).join(''):clean;const n=parseInt(normalized,16);return {r:(n>>16)&255,g:(n>>8)&255,b:n&255};}function darkenColor(hex,factor=0.22){const {r,g,b}=hexToRgb(hex);return `rgb(${Math.max(0,Math.floor(r*(1-factor)))},${Math.max(0,Math.floor(g*(1-factor)))},${Math.max(0,Math.floor(b*(1-factor)))})`;}function lightenColor(hex,factor=0.18){const {r,g,b}=hexToRgb(hex);return `rgb(${Math.min(255,Math.floor(r+(255-r)*factor))},${Math.min(255,Math.floor(g+(255-g)*factor))},${Math.min(255,Math.floor(b+(255-b)*factor))})`;}function alphaColor(hex,alpha){const {r,g,b}=hexToRgb(hex);return `rgba(${r},${g},${b},${alpha})`;}
 function normalizeCharacterColor(color){const raw=String(color||'').trim();const cleaned=raw.replace(/[^0-9a-fA-F]/g,'');if(cleaned.length===3){return cleaned.split('').map(ch=>ch+ch).join('').toLowerCase();}if(cleaned.length>=6){return cleaned.slice(0,6).toLowerCase();}return '60a5fa';}
 function buildCharacterSvgUrl(color){return `/character/${normalizeCharacterColor(color)}.svg`; }
 const playerMascotCache={};
-function getPlayerMascot(color){const key=normalizeCharacterColor(color);if(!playerMascotCache[key]){const img=new Image();img.onload=()=>{if(currentState)renderMap(currentState);};img.onerror=()=>{playerMascotCache[key]=null;};img.src=buildCharacterSvgUrl(key);playerMascotCache[key]=img;}return playerMascotCache[key];}
+function getPlayerMascot(color){const key=normalizeCharacterColor(color);if(!playerMascotCache[key]){const img=new Image();img.onload=()=>{if(currentState)scheduleTeacherMapRender(currentState);};img.onerror=()=>{playerMascotCache[key]=null;};img.src=buildCharacterSvgUrl(key);playerMascotCache[key]=img;}return playerMascotCache[key];}
 function drawPlayer(p){const size=30;const bodyColor=p.color||'#60a5fa';const mascot=getPlayerMascot(bodyColor);ctx.save();if(p.state==='battling'){ctx.globalAlpha=0.45}ctx.translate(p.x,p.y);ctx.shadowColor='rgba(15,23,42,0.18)';ctx.shadowBlur=4;ctx.shadowOffsetY=1;if(mascot&&mascot.complete&&mascot.naturalWidth>0){ctx.drawImage(mascot,-size/2,-size/2,size,size);}else{ctx.fillStyle=bodyColor;ctx.beginPath();ctx.arc(0,0,size/2.4,0,Math.PI*2);ctx.fill();}ctx.shadowColor='transparent';if(p.state==='battling'){ctx.beginPath();ctx.arc(0,0,size/2+5.8,0,Math.PI*2);ctx.strokeStyle='rgba(239,68,68,0.85)';ctx.lineWidth=2.2;ctx.stroke();}ctx.restore();ctx.fillStyle='#173b7a';ctx.font='12px Arial';ctx.textAlign='center';const teamLabel=(currentState&&currentState.room&&currentState.room.game_mode==='team'&&p.team)?` [${p.team}]`:'';ctx.fillText(`${p.nickname}${teamLabel}`,p.x,p.y-25)}
 function roundRect(x,y,w,h,r,fill,stroke){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();if(fill)ctx.fill();if(stroke)ctx.stroke()}
 showCreate();

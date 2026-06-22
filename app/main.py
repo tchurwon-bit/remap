@@ -72,6 +72,7 @@ DEFAULTS = {
     'game_mode': 'solo',
     'team_count': 4,
     'map_type': 'open',
+    'treasure_enabled': False,
     'map_width': 1060,
     'map_height': 612,
     'question_count': 1,
@@ -82,10 +83,7 @@ DEFAULTS = {
     'score_lose': 0,
     'player_speed': 7.5,
     'background_data_url': None,
-    'treasure_enabled': False,
-    'treasure_questions': [],
 }
-
 
 MAX_NICKNAME_LEN = 12
 MAX_ROOM_TITLE_LEN = 50
@@ -236,14 +234,16 @@ class Player:
     battles_played: int = 0
     correct_count: int = 0
     answer_count: int = 0
+    treasure_score: int = 0
+    treasure_correct_count: int = 0
+    treasure_answer_count: int = 0
     ws: WebSocket | None = None
     questions: list[Question] = field(default_factory=list)
     last_move_at: float = 0.0
     reconnect_token: str = ''
     disconnected_at: float | None = None
-    treasure_score: int = 0
-    treasure_results: dict[str, dict[str, Any]] = field(default_factory=dict)
-    current_treasure_id: str | None = None
+    treasure_solved: set[str] = field(default_factory=set)
+    current_treasure_id: str = ''
 
 
 @dataclass
@@ -280,6 +280,8 @@ def make_room_state() -> dict[str, Any]:
         'pending_participants': {},
         'encounters': set(),
         'battles': {},
+        'treasure_questions': [],
+        'treasure_chests': [],
         'game_status': 'idle',
         'game_started_at': None,
         'game_end_at': None,
@@ -290,7 +292,6 @@ def make_room_state() -> dict[str, Any]:
         'last_move_broadcast_at': 0.0,
         'ai_reviews': {},
         'ai_review_meta': {},
-        'treasure_chests': [],
         # 게임 종료 시점의 결과 스냅샷입니다.
         # 학생이 시상식 화면에서 나가도 최종 순위가 변하지 않도록 보관합니다.
         'final_results': None,
@@ -393,11 +394,16 @@ def new_room_code() -> str:
 
 def reset_runtime(keep_room: bool = True) -> None:
     preserved = {}
+    preserved_treasure_questions = [dict(q) for q in state.get('treasure_questions', [])] if keep_room else []
     if keep_room:
-        for k in ['room_title', 'teacher_owner', 'room_code', 'game_mode', 'team_count', 'map_type', 'map_width', 'map_height', 'question_count', 'question_time_limit', 'total_game_time', 'score_win', 'score_draw', 'score_lose', 'player_speed', 'background_data_url', 'treasure_enabled', 'treasure_questions']:
+        for k in ['room_title', 'teacher_owner', 'room_code', 'game_mode', 'team_count', 'map_type', 'treasure_enabled', 'map_width', 'map_height', 'question_count', 'question_time_limit', 'total_game_time', 'score_win', 'score_draw', 'score_lose', 'player_speed', 'background_data_url']:
             preserved[k] = state['settings'].get(k, DEFAULTS[k])
     state['settings'] = dict(DEFAULTS)
     state['settings'].update(preserved)
+    state['treasure_questions'] = preserved_treasure_questions
+    state['treasure_chests'] = []
+    if state['settings'].get('treasure_enabled') and state.get('treasure_questions'):
+        generate_treasure_chests()
     state['players'].clear()
     state['pending_participants'].clear()
     state['encounters'].clear()
@@ -410,7 +416,6 @@ def reset_runtime(keep_room: bool = True) -> None:
     state['last_move_broadcast_at'] = 0.0
     state['ai_reviews'] = {}
     state['ai_review_meta'] = {}
-    state['treasure_chests'] = generate_treasure_chests(state['settings'].get('treasure_questions') or []) if state['settings'].get('treasure_enabled') else []
     state['final_results'] = None
     state['logs'] = []
 
@@ -467,7 +472,9 @@ def rankings() -> list[dict[str, Any]]:
             'correct_count': p.correct_count,
             'answer_count': p.answer_count,
             'battles_played': p.battles_played,
-            'treasure_score': getattr(p, 'treasure_score', 0),
+            'treasure_score': p.treasure_score,
+            'treasure_correct_count': p.treasure_correct_count,
+            'treasure_answer_count': p.treasure_answer_count,
         })
     return out
 
@@ -493,189 +500,13 @@ def get_public_player(player: Player) -> dict[str, Any]:
         'battles_played': player.battles_played,
         'correct_count': player.correct_count,
         'answer_count': player.answer_count,
+        'treasure_score': player.treasure_score,
+        'treasure_correct_count': player.treasure_correct_count,
+        'treasure_answer_count': player.treasure_answer_count,
+        'treasure_solved_ids': sorted(list(player.treasure_solved)),
         'battled_ids': battled_ids,
         'connected': bool(player.ws),
     }
-
-
-def public_treasure_chests() -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    if not state['settings'].get('treasure_enabled'):
-        return rows
-    for chest in state.get('treasure_chests', []):
-        rows.append({
-            'id': chest.get('id'),
-            'x': chest.get('x'),
-            'y': chest.get('y'),
-            'score': chest.get('score', 0),
-        })
-    return rows
-
-
-def treasure_progress_payload() -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    if not state['settings'].get('treasure_enabled'):
-        return rows
-    players = list(state['players'].values())
-    for chest in state.get('treasure_chests', []):
-        chest_id = str(chest.get('id') or '')
-        attempts = 0
-        correct = 0
-        for p in players:
-            result = getattr(p, 'treasure_results', {}).get(chest_id)
-            if result:
-                attempts += 1
-                if result.get('correct'):
-                    correct += 1
-        rows.append({
-            'id': chest_id,
-            'label': chest.get('label') or chest_id,
-            'score': chest.get('score', 0),
-            'attempts': attempts,
-            'correct': correct,
-            'total_players': len(players),
-        })
-    return rows
-
-
-def get_treasure_chest(chest_id: str) -> dict[str, Any] | None:
-    for chest in state.get('treasure_chests', []):
-        if str(chest.get('id')) == str(chest_id):
-            return chest
-    return None
-
-
-def generate_treasure_chests(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not questions:
-        return []
-    w = int(state['settings']['map_width'])
-    h = int(state['settings']['map_height'])
-    chests: list[dict[str, Any]] = []
-    for idx, q in enumerate(questions, start=1):
-        x, y = 80.0, 80.0
-        for _ in range(120):
-            candidate_x = random.randint(60, max(70, w - 60))
-            candidate_y = random.randint(60, max(70, h - 60))
-            if collides_with_walls(candidate_x, candidate_y, 24):
-                continue
-            if any(math.dist((candidate_x, candidate_y), (c['x'], c['y'])) < 96 for c in chests):
-                continue
-            x, y = float(candidate_x), float(candidate_y)
-            break
-        chests.append({
-            'id': f'T{idx}',
-            'label': f'보물상자 {idx}',
-            'x': x,
-            'y': y,
-            'text': q['text'],
-            'choices': list(q['choices']),
-            'answer': int(q['answer']),
-            'score': int(q.get('score', 1)),
-        })
-    return chests
-
-
-def all_treasure_attempts_complete() -> bool:
-    if not state['settings'].get('treasure_enabled'):
-        return True
-    chests = state.get('treasure_chests', [])
-    if not chests:
-        return True
-    active_players = [p for p in state['players'].values() if p.questions and p.ws]
-    if not active_players:
-        return False
-    for p in active_players:
-        done = getattr(p, 'treasure_results', {})
-        for chest in chests:
-            if str(chest.get('id')) not in done:
-                return False
-    return True
-
-
-async def try_treasure_for(player: Player) -> None:
-    if not state['settings'].get('treasure_enabled') or state['game_status'] != 'running':
-        return
-    if player.state == 'battling' or getattr(player, 'current_treasure_id', None):
-        return
-    for chest in state.get('treasure_chests', []):
-        chest_id = str(chest.get('id') or '')
-        if not chest_id or chest_id in getattr(player, 'treasure_results', {}):
-            continue
-        if math.dist((player.x, player.y), (float(chest.get('x') or 0), float(chest.get('y') or 0))) <= 34:
-            await start_treasure(player, chest)
-            return
-
-
-async def start_treasure(player: Player, chest: dict[str, Any]) -> None:
-    chest_id = str(chest.get('id') or '')
-    if not chest_id or chest_id in getattr(player, 'treasure_results', {}):
-        return
-    player.state = 'battling'
-    player.current_treasure_id = chest_id
-    log(f'{player.nickname} 보물상자 문제 도전: {chest.get("label", chest_id)}', 'treasure')
-    await send_to_player(player.id, {
-        'type': 'treasure_question',
-        'chest_id': chest_id,
-        'label': chest.get('label') or chest_id,
-        'index': 1,
-        'total': 1,
-        'time_limit': int(state['settings']['question_time_limit']),
-        'score': int(chest.get('score') or 0),
-        'question': {'text': chest.get('text') or '', 'choices': list(chest.get('choices') or [])},
-        'room_title': state['settings']['room_title'],
-    })
-    await broadcast_state()
-    asyncio.create_task(treasure_timeout(player.id, chest_id))
-
-
-async def treasure_timeout(player_id: str, chest_id: str) -> None:
-    await asyncio.sleep(int(state['settings']['question_time_limit']))
-    p = state['players'].get(player_id)
-    if not p or getattr(p, 'current_treasure_id', None) != chest_id:
-        return
-    if chest_id in getattr(p, 'treasure_results', {}):
-        return
-    await finish_treasure_attempt(p, chest_id, selected=None, timed_out=True)
-
-
-async def finish_treasure_attempt(player: Player, chest_id: str, selected: int | None, timed_out: bool = False) -> None:
-    chest = get_treasure_chest(chest_id)
-    if not chest:
-        player.state = 'moving'
-        player.current_treasure_id = None
-        return
-    if chest_id in getattr(player, 'treasure_results', {}):
-        player.state = 'moving'
-        player.current_treasure_id = None
-        return
-    answer = int(chest.get('answer') or 0)
-    correct = selected is not None and int(selected) == answer
-    gained = int(chest.get('score') or 0) if correct else 0
-    player.treasure_results[chest_id] = {'selected': selected, 'correct': correct, 'score': gained, 'timed_out': timed_out}
-    player.treasure_score += gained
-    player.score += gained
-    if state['settings'].get('game_mode') == 'team' and player.team:
-        state['team_scores'][player.team] += gained
-    player.state = 'moving'
-    player.current_treasure_id = None
-    if correct:
-        log(f'{player.nickname} 보물상자 정답 +{gained}점', 'treasure')
-    elif timed_out:
-        log(f'{player.nickname} 보물상자 시간 초과', 'treasure')
-    else:
-        log(f'{player.nickname} 보물상자 오답', 'treasure')
-    await send_to_player(player.id, {
-        'type': 'treasure_result',
-        'chest_id': chest_id,
-        'correct': correct,
-        'selected': selected,
-        'timed_out': timed_out,
-        'gained_score': gained,
-        'my_score': player.score,
-        'answer': answer,
-    })
-    await broadcast_state()
-    asyncio.create_task(auto_end_after_results_delay())
 
 
 def battle_progress_payload() -> list[dict[str, Any]]:
@@ -727,8 +558,8 @@ def full_payload() -> dict[str, Any]:
         'remaining_time': remaining_time(),
         'countdown_remaining': countdown_remaining(),
         'map_walls': get_map_walls(),
-        'treasure_chests': public_treasure_chests(),
-        'treasure_progress': treasure_progress_payload(),
+        'treasure_chests': list(state.get('treasure_chests', [])),
+        'treasure_summary': treasure_summary_payload(),
         'logs': state['logs'][-30:],
         'student_logs': student_logs(30),
         'ai_reviews': list(state.get('ai_reviews', {}).values()),
@@ -768,7 +599,9 @@ async def send_to_player(player_id: str, payload: dict[str, Any]) -> None:
 
 def map_label() -> str:
     base = '미로형 맵' if state['settings'].get('map_type') == 'maze' else '오픈 스퀘어'
-    return base + (' + 보물상자' if state['settings'].get('treasure_enabled') else '')
+    if state['settings'].get('treasure_enabled'):
+        return base + ' + 보물상자'
+    return base
 
 
 def get_map_walls() -> list[dict[str, float]]:
@@ -810,6 +643,87 @@ def collides_with_walls(x: float, y: float, size: float = 14) -> bool:
     return False
 
 
+def normalize_treasure_questions(raw_items: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_items, list):
+        return []
+    questions: list[dict[str, Any]] = []
+    for idx, item in enumerate(raw_items[:12], start=1):
+        if not isinstance(item, dict):
+            continue
+        text = clean_text(item.get('text'), MAX_QUESTION_TEXT_LEN)
+        raw_choices = item.get('choices') if isinstance(item.get('choices'), list) else []
+        choices = [clean_text(choice, MAX_CHOICE_TEXT_LEN) for choice in raw_choices[:4]]
+        answer = clamp_int(item.get('answer'), 0, 0, 3)
+        score = clamp_int(item.get('score'), 5, 1, 50)
+        if text and len(choices) == 4 and all(choices) and 0 <= answer < 4:
+            questions.append({
+                'id': f'treasure_{len(questions) + 1}',
+                'text': text,
+                'choices': choices,
+                'answer': answer,
+                'score': score,
+                'index': len(questions) + 1,
+            })
+    return questions
+
+
+def point_near_treasure(x: float, y: float, min_distance: float = 54) -> bool:
+    for chest in state.get('treasure_chests', []):
+        if math.dist((x, y), (float(chest.get('x', 0)), float(chest.get('y', 0)))) < min_distance:
+            return True
+    return False
+
+
+def generate_treasure_chests() -> None:
+    state['treasure_chests'] = []
+    if not state['settings'].get('treasure_enabled'):
+        return
+    questions = state.get('treasure_questions', [])
+    if not questions:
+        return
+    w = int(state['settings']['map_width'])
+    h = int(state['settings']['map_height'])
+    chests: list[dict[str, Any]] = []
+    for idx, question in enumerate(questions, start=1):
+        placed = False
+        for _ in range(140):
+            x = random.randint(58, max(64, w - 58))
+            y = random.randint(58, max(64, h - 58))
+            if collides_with_walls(x, y, 22):
+                continue
+            if any(math.dist((x, y), (c['x'], c['y'])) < 86 for c in chests):
+                continue
+            chests.append({'id': question['id'], 'index': idx, 'x': float(x), 'y': float(y), 'score': int(question.get('score', 5))})
+            placed = True
+            break
+        if not placed:
+            # Fallback grid position that still keeps the feature usable.
+            x = min(w - 58, 70 + ((idx - 1) % 4) * 110)
+            y = min(h - 58, 70 + ((idx - 1) // 4) * 95)
+            chests.append({'id': question['id'], 'index': idx, 'x': float(x), 'y': float(y), 'score': int(question.get('score', 5))})
+    state['treasure_chests'] = chests
+
+
+def treasure_summary_payload() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    questions = {q.get('id'): q for q in state.get('treasure_questions', [])}
+    players = list(state['players'].values())
+    for chest in state.get('treasure_chests', []):
+        cid = chest.get('id')
+        solved = sum(1 for p in players if cid in getattr(p, 'treasure_solved', set()))
+        correct = sum(1 for p in players if cid in getattr(p, 'treasure_solved', set()) and any(True for _ in []))
+        # correct count is calculated from player aggregate only in this lightweight summary.
+        out.append({
+            'id': cid,
+            'index': chest.get('index'),
+            'score': chest.get('score'),
+            'solved_count': solved,
+            'player_count': len(players),
+            'question': questions.get(cid, {}).get('text', ''),
+        })
+    return out
+
+
 def participants_payload() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for pending in state['pending_participants'].values():
@@ -841,6 +755,8 @@ def random_spawn() -> tuple[float, float]:
         x = random.randint(50, max(60, w - 50))
         y = random.randint(50, max(60, h - 50))
         if collides_with_walls(x, y):
+            continue
+        if point_near_treasure(x, y, 60):
             continue
         if all(math.dist((x, y), (p.x, p.y)) > 70 for p in state['players'].values()):
             return x, y
@@ -886,18 +802,21 @@ async def maybe_auto_end_all_battles_complete() -> None:
         return
     if has_active_battles():
         return
-    if any(getattr(p, 'current_treasure_id', None) for p in state['players'].values()):
-        return
     possible = possible_battle_pairs()
-    treasure_ready = all_treasure_attempts_complete()
+    has_treasure = bool(state['settings'].get('treasure_enabled') and state.get('treasure_chests'))
     if possible:
         completed = {pair for pair in state['encounters'] if pair in possible}
-        if len(completed) >= len(possible) and treasure_ready:
-            log('모든 가능한 배틀/보물상자 완료 - 자동 종료')
-            await end_game('all_objectives_complete')
-    elif state['settings'].get('treasure_enabled') and treasure_ready:
-        log('모든 보물상자 문제 완료 - 자동 종료')
-        await end_game('all_treasures_complete')
+        if len(completed) < len(possible):
+            return
+    elif not has_treasure:
+        return
+    if has_treasure:
+        connected_players = [p for p in state['players'].values() if p.ws]
+        required = len(state.get('treasure_chests', []))
+        if connected_players and any(len(getattr(p, 'treasure_solved', set())) < required for p in connected_players):
+            return
+    log('모든 가능한 배틀/보물상자 완료 - 자동 종료')
+    await end_game('all_tasks_complete')
 
 
 async def auto_end_after_results_delay() -> None:
@@ -988,6 +907,97 @@ async def question_timeout(battle_id: str, player_id: str, expected_index: int) 
     await broadcast_state()
 
 
+def get_treasure_question(chest_id: str) -> dict[str, Any] | None:
+    for q in state.get('treasure_questions', []):
+        if q.get('id') == chest_id:
+            return q
+    return None
+
+
+def get_treasure_chest(chest_id: str) -> dict[str, Any] | None:
+    for chest in state.get('treasure_chests', []):
+        if chest.get('id') == chest_id:
+            return chest
+    return None
+
+
+async def try_treasure_for(player: Player) -> None:
+    if not state['settings'].get('treasure_enabled') or player.state == 'battling' or state['game_status'] != 'running':
+        return
+    for chest in state.get('treasure_chests', []):
+        chest_id = str(chest.get('id') or '')
+        if not chest_id or chest_id in player.treasure_solved:
+            continue
+        if math.dist((player.x, player.y), (float(chest.get('x', 0)), float(chest.get('y', 0)))) <= 34:
+            await start_treasure_question(player, chest_id)
+            return
+
+
+async def start_treasure_question(player: Player, chest_id: str) -> None:
+    question = get_treasure_question(chest_id)
+    chest = get_treasure_chest(chest_id)
+    if not question or not chest or chest_id in player.treasure_solved:
+        return
+    player.state = 'battling'
+    player.current_treasure_id = chest_id
+    await send_to_player(player.id, {
+        'type': 'treasure_question',
+        'chest_id': chest_id,
+        'index': int(chest.get('index') or question.get('index') or 1),
+        'score': int(question.get('score') or chest.get('score') or 2),
+        'time_limit': int(state['settings']['question_time_limit']),
+        'question': {'text': question['text'], 'choices': question['choices']},
+    })
+    log(f'{player.nickname} 보물상자 {chest.get("index", "")} 문제 도전', 'treasure')
+    await broadcast_state()
+    asyncio.create_task(treasure_timeout(player.id, chest_id))
+
+
+async def treasure_timeout(player_id: str, chest_id: str) -> None:
+    await asyncio.sleep(int(state['settings']['question_time_limit']))
+    player = state['players'].get(player_id)
+    if not player or player.state != 'battling' or player.current_treasure_id != chest_id:
+        return
+    await finish_treasure_question(player, chest_id, None, timed_out=True, time_used=int(state['settings']['question_time_limit']))
+
+
+async def finish_treasure_question(player: Player, chest_id: str, selected: int | None, timed_out: bool = False, time_used: float = 0.0) -> None:
+    question = get_treasure_question(chest_id)
+    chest = get_treasure_chest(chest_id)
+    if not question or chest_id in player.treasure_solved:
+        player.state = 'moving'
+        player.current_treasure_id = ''
+        return
+    correct = (selected is not None and int(selected) == int(question.get('answer', -1)))
+    points = int(question.get('score') or chest.get('score') or 2) if correct else 0
+    player.treasure_solved.add(chest_id)
+    player.treasure_answer_count += 1
+    if correct:
+        player.treasure_correct_count += 1
+        player.treasure_score += points
+        player.score += points
+        if state['settings'].get('game_mode') == 'team' and player.team:
+            state['team_scores'][player.team] += points
+    player.state = 'moving'
+    player.current_treasure_id = ''
+    await send_to_player(player.id, {'type': 'battle_feedback', 'correct': correct, 'selected': selected, 'timed_out': timed_out})
+    await send_to_player(player.id, {
+        'type': 'treasure_result',
+        'correct': correct,
+        'timed_out': timed_out,
+        'points': points,
+        'score': player.score,
+        'chest_index': int(chest.get('index') or question.get('index') or 1),
+        'answer_text': question['choices'][int(question.get('answer', 0))],
+    })
+    if correct:
+        log(f'{player.nickname} 보물상자 {chest.get("index", "")} 정답 +{points}점', 'treasure')
+    else:
+        log(f'{player.nickname} 보물상자 {chest.get("index", "")} 오답/시간초과', 'treasure')
+    await broadcast_state()
+    await maybe_auto_end_all_battles_complete()
+
+
 async def maybe_finish_battle(battle: Battle) -> None:
     if not (battle.side_a.finished and battle.side_b.finished) or battle.status != 'active':
         return
@@ -1051,7 +1061,9 @@ def build_game_end_payload() -> dict[str, Any]:
                 'correct_count': p.correct_count,
                 'answer_count': p.answer_count,
                 'battles_played': p.battles_played,
-                'treasure_score': getattr(p, 'treasure_score', 0),
+                'treasure_score': p.treasure_score,
+                'treasure_correct_count': p.treasure_correct_count,
+                'treasure_answer_count': p.treasure_answer_count,
                 'color': p.color,
             } for p in sorted(state['players'].values(), key=lambda p: (-p.score, -p.correct_count, p.nickname.lower()))
         ],
@@ -1190,7 +1202,7 @@ async def room_info(code: str) -> JSONResponse:
         return JSONResponse({'ok': False, 'title': '', 'game_mode': 'solo', 'team_count': 0, 'question_count': 0, 'question_time_limit': 0, 'map_width': 0, 'map_height': 0, 'map_type': 'open', 'map_label': '', 'status': 'invalid'})
     try:
         valid = bool(state['settings']['room_code']) and room_code == state['settings']['room_code']
-        return JSONResponse({'ok': valid, 'title': state['settings']['room_title'] if valid else '', 'teacher_owner': state['settings'].get('teacher_owner', '') if valid else '', 'game_mode': state['settings'].get('game_mode', 'solo') if valid else 'solo', 'team_count': state['settings']['team_count'] if valid and state['settings'].get('game_mode') == 'team' else 0, 'question_count': state['settings']['question_count'] if valid else 0, 'question_time_limit': state['settings']['question_time_limit'] if valid else 0, 'map_width': state['settings']['map_width'] if valid else 0, 'map_height': state['settings']['map_height'] if valid else 0, 'map_type': state['settings'].get('map_type', 'open') if valid else 'open', 'map_label': map_label() if valid else '', 'status': state['game_status'] if valid else 'invalid', 'treasure_enabled': bool(state['settings'].get('treasure_enabled')) if valid else False, 'treasure_count': len(state.get('treasure_chests', [])) if valid else 0})
+        return JSONResponse({'ok': valid, 'title': state['settings']['room_title'] if valid else '', 'teacher_owner': state['settings'].get('teacher_owner', '') if valid else '', 'game_mode': state['settings'].get('game_mode', 'solo') if valid else 'solo', 'team_count': state['settings']['team_count'] if valid and state['settings'].get('game_mode') == 'team' else 0, 'question_count': state['settings']['question_count'] if valid else 0, 'question_time_limit': state['settings']['question_time_limit'] if valid else 0, 'map_width': state['settings']['map_width'] if valid else 0, 'map_height': state['settings']['map_height'] if valid else 0, 'map_type': state['settings'].get('map_type', 'open') if valid else 'open', 'map_label': map_label() if valid else '', 'treasure_enabled': bool(state['settings'].get('treasure_enabled')) if valid else False, 'status': state['game_status'] if valid else 'invalid'})
     finally:
         unbind_room(token)
 
@@ -1215,7 +1227,7 @@ async def room_prepare(payload: dict[str, Any]) -> JSONResponse:
     pending_id = str(uuid.uuid4())
     state['pending_participants'][pending_id] = PendingParticipant(id=pending_id, nickname=nickname)
     await broadcast_state()
-    return JSONResponse({'ok': True, 'pending_id': pending_id, 'title': state['settings']['room_title'], 'game_mode': state['settings'].get('game_mode', 'solo'), 'team_count': state['settings']['team_count'] if state['settings'].get('game_mode') == 'team' else 0, 'question_count': state['settings']['question_count'], 'question_time_limit': state['settings']['question_time_limit'], 'map_width': state['settings']['map_width'], 'map_height': state['settings']['map_height'], 'map_type': state['settings'].get('map_type', 'open'), 'map_label': map_label(), 'status': state['game_status'], 'treasure_enabled': bool(state['settings'].get('treasure_enabled')), 'treasure_count': len(state.get('treasure_chests', []))})
+    return JSONResponse({'ok': True, 'pending_id': pending_id, 'title': state['settings']['room_title'], 'game_mode': state['settings'].get('game_mode', 'solo'), 'team_count': state['settings']['team_count'] if state['settings'].get('game_mode') == 'team' else 0, 'question_count': state['settings']['question_count'], 'question_time_limit': state['settings']['question_time_limit'], 'map_width': state['settings']['map_width'], 'map_height': state['settings']['map_height'], 'map_type': state['settings'].get('map_type', 'open'), 'map_label': map_label(), 'treasure_enabled': bool(state['settings'].get('treasure_enabled')), 'status': state['game_status']})
 
 
 @app.post('/api/room/cancel_prepare')
@@ -1261,6 +1273,14 @@ async def create_room(payload: dict[str, Any]) -> JSONResponse:
     map_type = str(payload.get('map_type') or DEFAULTS['map_type']).strip()
     if map_type not in {'open', 'maze'}:
         map_type = DEFAULTS['map_type']
+    treasure_enabled = bool(payload.get('treasure_enabled'))
+    raw_treasure_questions = payload.get('treasure_questions') if isinstance(payload.get('treasure_questions'), list) else []
+    treasure_count = clamp_int(payload.get('treasure_count'), 1, 1, 12)
+    treasure_questions = normalize_treasure_questions(raw_treasure_questions) if treasure_enabled else []
+    if treasure_enabled and len(treasure_questions) != treasure_count:
+        unbind_room(token)
+        rooms.pop(room_code, None)
+        return JSONResponse({'ok': False, 'message': f'보물상자 문제 ON 상태에서는 보물 문제 {treasure_count}개를 모두 완성해야 합니다.'}, status_code=400)
     background_data_url = payload.get('background_data_url')
     if isinstance(background_data_url, str) and background_data_url.startswith('data:image/'):
         background_data_url = background_data_url[:MAX_BACKGROUND_DATA_URL_LEN]
@@ -1272,6 +1292,8 @@ async def create_room(payload: dict[str, Any]) -> JSONResponse:
     state['settings']['game_mode'] = 'team' if str(payload.get('game_mode') or 'solo') == 'team' else 'solo'
     state['settings']['team_count'] = clamp_int(payload.get('team_count'), DEFAULTS['team_count'], 2, 5) if state['settings']['game_mode'] == 'team' else 0
     state['settings']['map_type'] = map_type
+    state['settings']['treasure_enabled'] = treasure_enabled
+    state['treasure_questions'] = treasure_questions
     state['settings']['map_width'] = clamp_int(payload.get('map_width'), DEFAULTS['map_width'], 480, 2400)
     state['settings']['map_height'] = clamp_int(payload.get('map_height'), DEFAULTS['map_height'], 360, 1600)
     state['settings']['question_count'] = clamp_int(payload.get('question_count'), DEFAULTS['question_count'], 1, 20)
@@ -1282,29 +1304,7 @@ async def create_room(payload: dict[str, Any]) -> JSONResponse:
     state['settings']['score_lose'] = clamp_int(payload.get('score_lose'), DEFAULTS['score_lose'], -20, 100)
     state['settings']['player_speed'] = clamp_float(payload.get('player_speed'), DEFAULTS['player_speed'], 1.0, 20.0)
     state['settings']['background_data_url'] = background_data_url
-    treasure_enabled = bool(payload.get('treasure_enabled'))
-    treasure_questions_raw = payload.get('treasure_questions') or []
-    if not isinstance(treasure_questions_raw, list):
-        treasure_questions_raw = []
-    treasure_questions: list[dict[str, Any]] = []
-    for idx, item in enumerate(treasure_questions_raw[:20], start=1):
-        if not isinstance(item, dict):
-            continue
-        q_text = clean_text(item.get('text'), MAX_QUESTION_TEXT_LEN)
-        raw_choices = item.get('choices') or []
-        if not isinstance(raw_choices, list):
-            raw_choices = []
-        choices = [clean_text(x, MAX_CHOICE_TEXT_LEN) for x in raw_choices[:4]]
-        blocked = find_blocked_profanity(q_text) or next((term for choice in choices for term in [find_blocked_profanity(choice)] if term), None)
-        if blocked:
-            continue
-        answer = clamp_int(item.get('answer'), 0, 0, 3)
-        score = clamp_int(item.get('score'), 1, 0, 100)
-        if q_text and len(choices) == 4 and all(choices):
-            treasure_questions.append({'text': q_text, 'choices': choices, 'answer': answer, 'score': score})
-    state['settings']['treasure_enabled'] = bool(treasure_enabled and treasure_questions)
-    state['settings']['treasure_questions'] = treasure_questions if state['settings']['treasure_enabled'] else []
-    state['treasure_chests'] = generate_treasure_chests(treasure_questions) if state['settings']['treasure_enabled'] else []
+    generate_treasure_chests()
     state['game_status'] = 'lobby'
     log(f"방 생성: {state['settings']['room_title']} ({state['settings']['room_code']})")
     await broadcast_state()
@@ -1324,6 +1324,7 @@ async def start_game(room: str = '') -> JSONResponse:
     state['game_status'] = 'countdown'
     state['game_started_at'] = None
     state['game_end_at'] = None
+    generate_treasure_chests()
     state['countdown_end_at'] = time.time() + 4
     log('게임 시작 카운트다운')
     await broadcast_state()
@@ -1777,49 +1778,6 @@ def build_questions_workbook_bytes() -> bytes:
         ws.column_dimensions[col].width = width
     ws.freeze_panes = 'A5'
 
-    if state['settings'].get('treasure_enabled'):
-        tws = wb.create_sheet('보물상자문제')
-        treasure_headers = ['보물상자', '문제', '선지 1', '선지 2', '선지 3', '선지 4', '정답', '점수']
-        for col, value in enumerate(treasure_headers, start=1):
-            cell = tws.cell(row=1, column=col, value=value)
-            cell.font = Font(bold=True, color='FFFFFF')
-            cell.fill = PatternFill('solid', fgColor='B45309')
-            cell.alignment = Alignment(horizontal='center')
-        for row_idx, chest in enumerate(state.get('treasure_chests', []), start=2):
-            choices = chest.get('choices') or []
-            answer = int(chest.get('answer') or 0)
-            values = [chest.get('label') or chest.get('id'), chest.get('text') or '', *(choices + [''] * 4)[:4], choices[answer] if 0 <= answer < len(choices) else '', chest.get('score', 0)]
-            for col, value in enumerate(values, start=1):
-                cell = tws.cell(row=row_idx, column=col, value=value)
-                cell.border = border
-                cell.alignment = Alignment(vertical='top', wrap_text=True)
-        tws.column_dimensions['A'].width = 16
-        tws.column_dimensions['B'].width = 38
-        for col in ['C','D','E','F','G']:
-            tws.column_dimensions[col].width = 22
-        tws.column_dimensions['H'].width = 10
-
-        rws = wb.create_sheet('보물상자결과')
-        result_headers = ['닉네임', '팀', '보물상자', '정답 여부', '획득 점수']
-        for col, value in enumerate(result_headers, start=1):
-            cell = rws.cell(row=1, column=col, value=value)
-            cell.font = Font(bold=True, color='FFFFFF')
-            cell.fill = PatternFill('solid', fgColor='0F766E')
-            cell.alignment = Alignment(horizontal='center')
-        row_idx = 2
-        for player in players:
-            for chest in state.get('treasure_chests', []):
-                chest_id = str(chest.get('id') or '')
-                result = getattr(player, 'treasure_results', {}).get(chest_id, {})
-                values = [player.nickname, f'{player.team}팀' if player.team else '-', chest.get('label') or chest_id, '정답' if result.get('correct') else ('오답/미풀이' if result else '미풀이'), result.get('score', 0) if result else 0]
-                for col, value in enumerate(values, start=1):
-                    cell = rws.cell(row=row_idx, column=col, value=value)
-                    cell.border = border
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-                row_idx += 1
-        for col in ['A','B','C','D','E']:
-            rws.column_dimensions[col].width = 18
-
     bio = BytesIO()
     wb.save(bio)
     bio.seek(0)
@@ -1905,6 +1863,31 @@ async def ws_player(ws: WebSocket) -> None:
                 if len(questions) != required_count:
                     await safe_send(ws, {'type': 'error', 'message': f'이 방은 문제 {required_count}개를 정확히 입력해야 합니다.'})
                     continue
+
+                # v3.39 duplicate join guard: double tap/retry/case variation must not create a second avatar.
+                if player_id and player_id in state['players']:
+                    existing = state['players'][player_id]
+                    await safe_send(ws, {'type': 'joined', 'player_id': existing.id, 'reconnect_token': existing.reconnect_token, 'settings': state['settings'], 'room_title': state['settings']['room_title'], 'room_code': state['settings']['room_code']})
+                    continue
+                duplicate = next((p for p in state['players'].values() if p.nickname.lower() == nickname.lower()), None)
+                if duplicate:
+                    if duplicate.ws is None or duplicate.disconnected_at is not None:
+                        player_id = duplicate.id
+                        duplicate.ws = ws
+                        duplicate.disconnected_at = None
+                        duplicate.team = team
+                        duplicate.color = color
+                        duplicate.questions = questions
+                        duplicate.last_move_at = time.time()
+                        if not duplicate.reconnect_token:
+                            duplicate.reconnect_token = str(uuid.uuid4())
+                        await safe_send(ws, {'type': 'joined', 'player_id': duplicate.id, 'reconnect_token': duplicate.reconnect_token, 'settings': state['settings'], 'room_title': state['settings']['room_title'], 'room_code': state['settings']['room_code']})
+                        log(f'{nickname} 재입장')
+                        await broadcast_state()
+                        continue
+                    await safe_send(ws, {'type': 'error', 'message': '이미 입장한 닉네임입니다. 기존 화면을 사용하거나 나가기 후 다시 입장해주세요.'})
+                    continue
+
                 x, y = random_spawn()
                 player_id = str(uuid.uuid4())
                 reconnect_token = str(uuid.uuid4())
@@ -1972,23 +1955,22 @@ async def ws_player(ws: WebSocket) -> None:
                     p.x = next_x
                 if not collides_with_walls(p.x, next_y):
                     p.y = next_y
-                await try_treasure_for(p)
-                if p.state != 'battling':
-                    await try_collisions_for(p)
+                await try_collisions_for(p)
+                if p.state == 'moving':
+                    await try_treasure_for(p)
                 if now - float(state.get('last_move_broadcast_at') or 0.0) >= MOVE_BROADCAST_INTERVAL:
                     state['last_move_broadcast_at'] = now
                     await broadcast_state()
             elif msg_type == 'treasure_answer' and player_id:
                 p = state['players'].get(player_id)
-                if not p:
-                    continue
                 chest_id = str(msg.get('chest_id') or '')
+                if not p or not chest_id or p.current_treasure_id != chest_id:
+                    continue
                 selected = clamp_int(msg.get('selected'), -1, -1, 3)
                 if selected < 0:
                     continue
-                if getattr(p, 'current_treasure_id', None) != chest_id:
-                    continue
-                await finish_treasure_attempt(p, chest_id, selected=selected, timed_out=False)
+                time_used = clamp_float(msg.get('time_used'), 0.0, 0.0, float(state['settings'].get('question_time_limit') or DEFAULTS['question_time_limit']))
+                await finish_treasure_question(p, chest_id, selected, timed_out=False, time_used=time_used)
             elif msg_type == 'answer' and player_id:
                 battle_id = msg.get('battle_id')
                 selected = clamp_int(msg.get('selected'), -1, -1, 3)
@@ -2179,6 +2161,12 @@ TEACHER_CEREMONY_HTML = """
     padding:8px 10px!important;
   }
 }
+
+
+/* ===== v3.38 treasure chest mode ===== */
+.treasureModeBox{background:linear-gradient(135deg,rgba(24,54,91,.96),rgba(13,37,70,.96));border:1px solid rgba(125,211,252,.34);border-radius:18px;padding:12px;box-shadow:0 14px 32px rgba(7,18,38,.18);color:#eaf7ff}
+.treasureToggleRow{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.treasureToggleLabel{display:flex;align-items:center;gap:9px;font-weight:1000;color:#eaf7ff}.treasureToggleLabel input{width:18px;height:18px;accent-color:#38bdf8}.treasureConfig{display:none;margin-top:12px;border-top:1px solid rgba(125,211,252,.22);padding-top:12px}.treasureConfig.active{display:block}.treasureTopRow{display:grid;grid-template-columns:minmax(180px,240px) minmax(0,1fr);gap:10px;align-items:end}.treasureEditor{display:grid;gap:10px;margin-top:10px}.treasureItem{border:1px solid rgba(191,219,254,.20);background:linear-gradient(180deg,rgba(226,241,255,.12),rgba(255,255,255,.07));border-radius:16px;padding:10px}.treasureItemHeader{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;color:#fff;font-weight:1000}.treasureItem textarea{min-height:58px}.treasureItem textarea,.treasureItem input,.treasureItem select{background:linear-gradient(180deg,#f8fbff,#e7f1ff)!important;color:#102846!important;border-color:#b8d2f0!important}.treasureChoices{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px}.treasureItem input,.treasureItem textarea,.treasureItem select{width:100%}.treasureMetaGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}.treasureHint{font-size:12px;color:#b9d8f5;font-weight:800;line-height:1.35}.treasureSummaryPanel{border-color:rgba(251,191,36,.28)!important;background:linear-gradient(180deg,rgba(251,191,36,.10),rgba(255,255,255,.055))!important}.treasureSummaryItem{display:flex;justify-content:space-between;gap:8px;align-items:center;padding:8px 10px;border-radius:12px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.10);font-size:12px}.treasureSummaryItem strong{color:#fde68a}
+@media(max-width:820px){.treasureTopRow{grid-template-columns:1fr}.treasureChoices{grid-template-columns:1fr}.treasureMetaGrid{grid-template-columns:1fr 1fr}.treasureModeBox{padding:10px}}
 
 </style>
 </head>
@@ -3989,7 +3977,7 @@ button.soft{
 <script>
 const CHAR_COLORS = __CHAR_COLORS__;
 const TEAM_COLORS = {'A':'#3b82f6','B':'#ef4444','C':'#facc15','D':'#22c55e','E':'#94a3b8'};
-const state={socket:null,playerId:null,reconnectToken:null,myPlayer:null,players:[],rankings:[],teamRankings:[],battles:[],treasureChests:[],treasureProgress:[],settings:null,gameStatus:'idle',remainingTime:0,logs:[],keys:{},questions:[],currentBattle:null,timerHandle:null,bgImage:null,selectedTeam:'A',selectedColor:CHAR_COLORS[0],roomCode:'',roomTitle:'',nickname:'',autoResultHide:null,roomInfo:null,pendingId:null,mapWalls:[],countdownActive:false,countdownTimer:null,renderPlayers:{},lastFrameTs:0,lastMoveSentAt:0,animationFrameId:null,gameLoopRunning:false,intentionalClose:false,reconnectAttempts:0,reconnectTimer:null};
+const state={socket:null,playerId:null,reconnectToken:null,myPlayer:null,players:[],rankings:[],teamRankings:[],battles:[],settings:null,gameStatus:'idle',remainingTime:0,logs:[],keys:{},questions:[],currentBattle:null,timerHandle:null,bgImage:null,selectedTeam:'A',selectedColor:CHAR_COLORS[0],roomCode:'',roomTitle:'',nickname:'',autoResultHide:null,roomInfo:null,pendingId:null,mapWalls:[],treasureChests:[],countdownActive:false,countdownTimer:null,renderPlayers:{},lastFrameTs:0,lastMoveSentAt:0,animationFrameId:null,gameLoopRunning:false,intentionalClose:false,reconnectAttempts:0,reconnectTimer:null,joining:false};
 const roomCodeInput=document.getElementById('roomCode'), nicknameInput=document.getElementById('nickname');
 const questionsList=document.getElementById('questionsList'), joinBtn=document.getElementById('joinBtn'), checkRoomBtn=document.getElementById('checkRoomBtn');
 const joinScreen=document.getElementById('joinScreen'), prepScreen=document.getElementById('prepScreen'), gameScreen=document.getElementById('gameScreen'), endScreen=document.getElementById('endScreen');
@@ -4127,7 +4115,7 @@ function savePlayerSession(){try{if(state.playerId&&state.reconnectToken&&state.
 function clearPlayerSession(){try{sessionStorage.removeItem('remap_player_session');}catch(e){}}
 function loadPlayerSession(){try{const raw=sessionStorage.getItem('remap_player_session');if(!raw)return null;const data=JSON.parse(raw);if(!data||!data.playerId||!data.reconnectToken||!data.roomCode)return null;if(Date.now()-Number(data.ts||0)>1000*60*60)return null;return data;}catch(e){return null;}}
 function scheduleReconnect(){if(state.intentionalClose||!state.playerId||!state.reconnectToken||!state.roomCode)return;clearTimeout(state.reconnectTimer);const attempt=Math.min(6,Number(state.reconnectAttempts||0)+1);state.reconnectAttempts=attempt;const delay=Math.min(5000,500*attempt);showToast('연결이 잠시 끊겼습니다. 다시 연결 중...', 'bottom');state.reconnectTimer=setTimeout(()=>connectPlayer(state.roomCode,true),delay);}
-function setupJoinedSession(msg, ws){state.pendingId=null;state.nickname=state.nickname||nicknameInput.value.trim();state.playerId=msg.player_id;state.reconnectToken=msg.reconnect_token||state.reconnectToken;state.settings=msg.settings;state.roomTitle=msg.room_title;state.roomCode=msg.room_code;state.reconnectAttempts=0;state.intentionalClose=false;savePlayerSession();roomTitleBar.textContent='REMAP';state.renderPlayers={};state.lastFrameTs=0;resizeCanvas();prepScreen.style.display='none';joinScreen.style.display='none';endScreen.style.display='none';gameScreen.style.display='grid';document.body.classList.add('show-top-leave');setGameActive(true);state.socket=ws;render();startGameLoop();}
+function setupJoinedSession(msg, ws){state.joining=false;if(joinBtn)joinBtn.disabled=false;state.pendingId=null;state.nickname=state.nickname||nicknameInput.value.trim();state.playerId=msg.player_id;state.reconnectToken=msg.reconnect_token||state.reconnectToken;state.settings=msg.settings;state.roomTitle=msg.room_title;state.roomCode=msg.room_code;state.reconnectAttempts=0;state.intentionalClose=false;savePlayerSession();roomTitleBar.textContent='REMAP';state.renderPlayers={};state.lastFrameTs=0;resizeCanvas();prepScreen.style.display='none';joinScreen.style.display='none';endScreen.style.display='none';gameScreen.style.display='grid';document.body.classList.add('show-top-leave');setGameActive(true);state.socket=ws;render();startGameLoop();}
 function setRoomInfo(info){state.roomInfo=info;state.pendingId=info.pending_id||state.pendingId;state.roomCode=roomCodeInput.value.trim().toUpperCase()||state.roomCode;state.roomTitle=info.title||'';state.nickname=(nicknameInput.value.trim()||state.nickname).trim();if(state.nickname&&!nicknameInput.value.trim()){nicknameInput.value=state.nickname;}roomTitleBar.textContent='REMAP';document.getElementById('infoTitle').textContent=info.title||'-';document.getElementById('infoCode').textContent=state.roomCode||'-';document.getElementById('infoMode').textContent=info.game_mode==='team'?`${info.team_count}팀전`:'개인전';document.getElementById('infoQuestions').textContent=`${info.question_count}문제`;document.getElementById('infoTime').textContent=`${info.question_time_limit}초`;document.getElementById('infoMap').textContent=info.map_label||'-';infoNickname.textContent=state.nickname||nicknameInput.value.trim()||'-';state.selectedTeam='A';ensureQuestionCount(info.question_count);if(info.game_mode==='team'){teamSection.style.display='block';renderTeams(info.team_count);colorWrap.style.display='none';colorHelp.textContent='팀전에서는 캐릭터 색상이 팀별로 고정됩니다.';}else{teamSection.style.display='none';teamWrap.innerHTML='';colorWrap.style.display='grid';colorHelp.textContent='캐릭터 색상 선택';renderColors();}renderQuestionEditor();joinScreen.style.display='none';prepScreen.style.display='flex';document.body.classList.add('show-top-leave');}
 async function cancelPending(){if(state.pendingId){try{await fetch('/api/room/cancel_prepare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pending_id:state.pendingId,code:state.roomCode||roomCodeInput.value.trim().toUpperCase()})});}catch(e){}state.pendingId=null;}}
 async function checkRoom(){const code=roomCodeInput.value.trim().toUpperCase();const nickname=(nicknameInput.value.trim()||state.nickname).trim();if(!code){showToast('방 코드를 입력하세요.');return;}if(!nickname){showToast('닉네임을 입력하세요.');return;}state.nickname=nickname;nicknameInput.value=nickname;const res=await fetch('/api/room/prepare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code,nickname})});const data=await res.json();if(!data.ok){roomInfo.textContent=data.message||'입장할 수 없습니다.';showToast(data.message||'입장할 수 없습니다.');return;}roomInfo.textContent=`${data.title} · ${data.game_mode==='team'?data.team_count+'팀전':'개인전'} · ${data.question_count}문제`;setRoomInfo(data);} 
@@ -4137,19 +4125,19 @@ function normalizeProfanityText(v){return String(v||'').toLowerCase().replace(/[
 function findBlockedProfanity(v){const s=normalizeProfanityText(v);return BLOCKED_PROFANITY_TERMS.find(t=>s.includes(t))||'';}
 function findQuestionProfanity(){for(let i=0;i<state.questions.length;i++){const q=state.questions[i]||{};let term=findBlockedProfanity(q.text);if(term)return {index:i+1,field:'문제',term};for(let j=0;j<(q.choices||[]).length;j++){term=findBlockedProfanity(q.choices[j]);if(term)return {index:i+1,field:`선택지 ${j+1}`,term};}}return null;}
 setTimeout(()=>{const saved=loadPlayerSession();if(saved&&joinScreen.style.display!=='none'){state.playerId=saved.playerId;state.reconnectToken=saved.reconnectToken;state.roomCode=saved.roomCode;state.nickname=saved.nickname||'';nicknameInput.value=state.nickname||nicknameInput.value;roomCodeInput.value=state.roomCode;showToast('이전 접속을 복구합니다.','bottom');connectPlayer(state.roomCode,true);}},500);
-joinBtn.onclick=()=>{if(!state.roomInfo){showToast('먼저 방 코드를 확인하세요.');return;}const nick=(nicknameInput.value.trim()||state.nickname).trim();if(!nick){showToast('닉네임을 입력하세요.');return;}state.nickname=nick;nicknameInput.value=nick;const required=state.roomInfo.question_count;ensureQuestionCount(required);const validQuestions=state.questions.length===required&&!state.questions.some(q=>!q.text.trim()||q.choices.some(c=>!c.trim()));if(!validQuestions){showToast(`문제 ${required}개를 모두 입력하세요.`);return;}const bad=findQuestionProfanity();if(bad){showToast(`${bad.index}번 ${bad.field}에 사용할 수 없는 표현이 포함되어 있습니다.`);return;}connectPlayer(state.roomCode)};
+joinBtn.onclick=()=>{if(state.joining){showToast('입장 처리 중입니다. 잠시만 기다려주세요.');return;}if(!state.roomInfo){showToast('먼저 방 코드를 확인하세요.');return;}const nick=(nicknameInput.value.trim()||state.nickname).trim();if(!nick){showToast('닉네임을 입력하세요.');return;}state.nickname=nick;nicknameInput.value=nick;const required=state.roomInfo.question_count;ensureQuestionCount(required);const validQuestions=state.questions.length===required&&!state.questions.some(q=>!q.text.trim()||q.choices.some(c=>!c.trim()));if(!validQuestions){showToast(`문제 ${required}개를 모두 입력하세요.`);return;}const bad=findQuestionProfanity();if(bad){showToast(`${bad.index}번 ${bad.field}에 사용할 수 없는 표현이 포함되어 있습니다.`);return;}state.joining=true;joinBtn.disabled=true;connectPlayer(state.roomCode)};
 async function goBackToJoin(){await cancelPending();setGameActive(false);prepScreen.style.display='none';joinScreen.style.display='flex';state.roomInfo=null;state.questions=[];document.body.classList.remove('show-top-leave');roomTitleBar.textContent='REMAP';}
 backBtn.onclick=goBackToJoin;
-function connectPlayer(code,resume=false){const wsUrl=new URL('/ws/player', location.href);wsUrl.protocol=location.protocol==='https:'?'wss:':'ws:';const ws=new WebSocket(wsUrl.href);ws.onopen=()=>{if(resume&&state.playerId&&state.reconnectToken){ws.send(JSON.stringify({type:'resume',room_code:code,player_id:state.playerId,reconnect_token:state.reconnectToken}));}else{ws.send(JSON.stringify({type:'join',pending_id:state.pendingId,room_code:code,team:state.selectedTeam,color:state.selectedColor,nickname:state.nickname||nicknameInput.value.trim(),questions:state.questions}));}};ws.onmessage=(ev)=>{const msg=JSON.parse(ev.data);if(msg.type==='error'){showToast(msg.message);state.intentionalClose=true;try{ws.close();}catch(e){}}else if(msg.type==='joined'||msg.type==='resumed'){setupJoinedSession(msg,ws);if(msg.type==='resumed')showToast('연결이 복구되었습니다.','bottom','success');}else if(msg.type==='state'){const prevStatus=state.gameStatus;state.players=msg.players;state.rankings=msg.rankings;state.teamRankings=msg.team_rankings;state.settings=msg.settings;state.battles=msg.battles;state.treasureChests=msg.treasure_chests||[];state.treasureProgress=msg.treasure_progress||[];state.gameStatus=msg.game_status;state.remainingTime=msg.remaining_time;state.logs=msg.student_logs||msg.logs||[];state.mapWalls=msg.map_walls||[];state.roomTitle=msg.room.title;roomTitleBar.textContent='REMAP';statusBar.textContent=`[현재상황: ${msg.game_status==='countdown'?'시작 카운트다운':msg.game_status==='running'?'게임 진행 중':msg.game_status==='finished'?'게임 종료':'준비 중'}]`;if(msg.game_status==='countdown'&&prevStatus!=='countdown'){startCountdownOverlay(msg.countdown_remaining||4)}syncRenderPlayers(msg.players);state.myPlayer=state.players.find(p=>p.id===state.playerId)||null;resizeCanvas();if(state.gameLoopRunning&&gameScreen.style.display==='grid'){renderHud();}else{render();}}else if(msg.type==='battle_intro'){showBattleIntro(msg)}else if(msg.type==='battle_question'){startBattleQuestion(msg)}else if(msg.type==='treasure_question'){startTreasureQuestion(msg)}else if(msg.type==='battle_feedback'){showAnswerFeedback(msg)}else if(msg.type==='battle_result'){showBattleResult(msg)}else if(msg.type==='treasure_result'){showTreasureResult(msg)}else if(msg.type==='game_end'){showEndScreen(msg)}else if(msg.type==='reset'){clearPlayerSession();showToast(msg.message||'다음 게임 준비');if(msg.target==='home'){leaveToHome(false)}else{leaveToPrep(true)}}};ws.onerror=()=>{};ws.onclose=()=>{if(state.socket===ws){state.socket=null;stopGameLoop();if(!state.intentionalClose&&gameScreen.style.display==='grid'&&state.gameStatus!=='finished'){scheduleReconnect();}}};}
-function leaveToPrep(keepQuestions=false){state.intentionalClose=true;clearTimeout(state.reconnectTimer);clearPlayerSession();stopGameLoop();clearPlayTimers();if(state.socket){try{state.socket.close();}catch(e){}}state.socket=null;state.playerId=null;state.reconnectToken=null;state.myPlayer=null;state.players=[];state.rankings=[];state.teamRankings=[];state.battles=[];state.logs=[];state.keys={};state.currentBattle=null;setGameActive(false);gameScreen.style.display='none';endScreen.style.display='none';joinScreen.style.display='none';prepScreen.style.display='flex';document.body.classList.add('show-top-leave');battleOverlay.style.display='none';resultOverlay.style.display='none';countdownOverlay.style.display='none';statusBar.textContent='[현재상황: 준비 중]';roomTitleBar.textContent='REMAP';state.pendingId=null;state.renderPlayers={};state.lastFrameTs=0;if(keepQuestions){ensureQuestionCount(state.roomInfo?.question_count||state.questions.length||0);}else{state.questions=buildEmptyQuestions(state.roomInfo?.question_count||0);}infoNickname.textContent=state.nickname||nicknameInput.value.trim()||'-';renderQuestionEditor();}
-function leaveToHome(send=true){state.intentionalClose=true;clearTimeout(state.reconnectTimer);clearPlayerSession();stopGameLoop();clearPlayTimers();if(send&&state.socket&&state.socket.readyState===1){state.socket.send(JSON.stringify({type:'leave'}));}if(state.socket){try{state.socket.close();}catch(e){}}state.socket=null;state.playerId=null;state.reconnectToken=null;state.myPlayer=null;state.players=[];state.rankings=[];state.teamRankings=[];state.battles=[];state.logs=[];state.keys={};state.currentBattle=null;setGameActive(false);gameScreen.style.display='none';prepScreen.style.display='none';endScreen.style.display='none';joinScreen.style.display='flex';document.body.classList.remove('show-top-leave');battleOverlay.style.display='none';resultOverlay.style.display='none';countdownOverlay.style.display='none';state.pendingId=null;state.nickname='';state.renderPlayers={};state.lastFrameTs=0;statusBar.textContent='[현재상황: 준비 중]';roomTitleBar.textContent='REMAP';}
+function connectPlayer(code,resume=false){const wsUrl=new URL('/ws/player', location.href);wsUrl.protocol=location.protocol==='https:'?'wss:':'ws:';const ws=new WebSocket(wsUrl.href);ws.onopen=()=>{if(resume&&state.playerId&&state.reconnectToken){ws.send(JSON.stringify({type:'resume',room_code:code,player_id:state.playerId,reconnect_token:state.reconnectToken}));}else{ws.send(JSON.stringify({type:'join',pending_id:state.pendingId,room_code:code,team:state.selectedTeam,color:state.selectedColor,nickname:state.nickname||nicknameInput.value.trim(),questions:state.questions}));}};ws.onmessage=(ev)=>{const msg=JSON.parse(ev.data);if(msg.type==='error'){state.joining=false;if(joinBtn)joinBtn.disabled=false;showToast(msg.message);state.intentionalClose=true;try{ws.close();}catch(e){}}else if(msg.type==='joined'||msg.type==='resumed'){setupJoinedSession(msg,ws);if(msg.type==='resumed')showToast('연결이 복구되었습니다.','bottom','success');}else if(msg.type==='state'){const prevStatus=state.gameStatus;state.players=msg.players;state.rankings=msg.rankings;state.teamRankings=msg.team_rankings;state.settings=msg.settings;state.battles=msg.battles;state.gameStatus=msg.game_status;state.remainingTime=msg.remaining_time;state.logs=msg.student_logs||msg.logs||[];state.mapWalls=msg.map_walls||[];state.treasureChests=msg.treasure_chests||[];state.roomTitle=msg.room.title;roomTitleBar.textContent='REMAP';statusBar.textContent=`[현재상황: ${msg.game_status==='countdown'?'시작 카운트다운':msg.game_status==='running'?'게임 진행 중':msg.game_status==='finished'?'게임 종료':'준비 중'}]`;if(msg.game_status==='countdown'&&prevStatus!=='countdown'){startCountdownOverlay(msg.countdown_remaining||4)}syncRenderPlayers(msg.players);state.myPlayer=state.players.find(p=>p.id===state.playerId)||null;resizeCanvas();if(state.gameLoopRunning&&gameScreen.style.display==='grid'){renderHud();}else{render();}}else if(msg.type==='battle_intro'){showBattleIntro(msg)}else if(msg.type==='battle_question'){startBattleQuestion(msg)}else if(msg.type==='treasure_question'){startTreasureQuestion(msg)}else if(msg.type==='battle_feedback'){showAnswerFeedback(msg)}else if(msg.type==='battle_result'){showBattleResult(msg)}else if(msg.type==='treasure_result'){showTreasureResult(msg)}else if(msg.type==='game_end'){showEndScreen(msg)}else if(msg.type==='reset'){clearPlayerSession();showToast(msg.message||'다음 게임 준비');if(msg.target==='home'){leaveToHome(false)}else{leaveToPrep(true)}}};ws.onerror=()=>{};ws.onclose=()=>{if(!state.playerId){state.joining=false;if(joinBtn)joinBtn.disabled=false;}if(state.socket===ws){state.socket=null;stopGameLoop();if(!state.intentionalClose&&gameScreen.style.display==='grid'&&state.gameStatus!=='finished'){scheduleReconnect();}}};}
+function leaveToPrep(keepQuestions=false){state.joining=false;if(joinBtn)joinBtn.disabled=false;state.intentionalClose=true;clearTimeout(state.reconnectTimer);clearPlayerSession();stopGameLoop();clearPlayTimers();if(state.socket){try{state.socket.close();}catch(e){}}state.socket=null;state.playerId=null;state.reconnectToken=null;state.myPlayer=null;state.players=[];state.rankings=[];state.teamRankings=[];state.battles=[];state.logs=[];state.keys={};state.currentBattle=null;setGameActive(false);gameScreen.style.display='none';endScreen.style.display='none';joinScreen.style.display='none';prepScreen.style.display='flex';document.body.classList.add('show-top-leave');battleOverlay.style.display='none';resultOverlay.style.display='none';countdownOverlay.style.display='none';statusBar.textContent='[현재상황: 준비 중]';roomTitleBar.textContent='REMAP';state.pendingId=null;state.renderPlayers={};state.lastFrameTs=0;if(keepQuestions){ensureQuestionCount(state.roomInfo?.question_count||state.questions.length||0);}else{state.questions=buildEmptyQuestions(state.roomInfo?.question_count||0);}infoNickname.textContent=state.nickname||nicknameInput.value.trim()||'-';renderQuestionEditor();}
+function leaveToHome(send=true){state.joining=false;if(joinBtn)joinBtn.disabled=false;state.intentionalClose=true;clearTimeout(state.reconnectTimer);clearPlayerSession();stopGameLoop();clearPlayTimers();if(send&&state.socket&&state.socket.readyState===1){state.socket.send(JSON.stringify({type:'leave'}));}if(state.socket){try{state.socket.close();}catch(e){}}state.socket=null;state.playerId=null;state.reconnectToken=null;state.myPlayer=null;state.players=[];state.rankings=[];state.teamRankings=[];state.battles=[];state.logs=[];state.keys={};state.currentBattle=null;setGameActive(false);gameScreen.style.display='none';prepScreen.style.display='none';endScreen.style.display='none';joinScreen.style.display='flex';document.body.classList.remove('show-top-leave');battleOverlay.style.display='none';resultOverlay.style.display='none';countdownOverlay.style.display='none';state.pendingId=null;state.nickname='';state.renderPlayers={};state.lastFrameTs=0;statusBar.textContent='[현재상황: 준비 중]';roomTitleBar.textContent='REMAP';}
 document.getElementById('endHomeBtn').onclick=()=>leaveToHome(true);leaveBtn.onclick=()=>leaveToHome(true);if(topLeaveBtn)topLeaveBtn.onclick=async()=>{if(prepScreen.style.display==='flex'){await goBackToJoin();}else{leaveToHome(true);}};
 function resizeCanvas(){if(!state.settings)return;const w=Number(state.settings.map_width)||1060;const h=Number(state.settings.map_height)||612;if(canvas.width!==w)canvas.width=w;if(canvas.height!==h)canvas.height=h;if(state.settings.background_data_url){if(!state.bgImage||state.bgImage.src!==state.settings.background_data_url){const img=new Image();img.onload=()=>{if(!state.gameLoopRunning)render();};img.src=state.settings.background_data_url;state.bgImage=img;}}else if(state.bgImage){state.bgImage=null;}}
 function formatTime(sec){const m=Math.floor(sec/60);const s=sec%60;return `${m}:${String(s).padStart(2,'0')}`}
 function syncRenderPlayers(players){const seen=new Set();(players||[]).forEach(p=>{seen.add(p.id);const current=state.renderPlayers[p.id];if(current){current.targetX=p.x;current.targetY=p.y;current.nickname=p.nickname;current.color=p.color;current.team=p.team;current.state=p.state;current.direction=p.direction;current.score=p.score;}else{state.renderPlayers[p.id]={x:p.x,y:p.y,targetX:p.x,targetY:p.y,nickname:p.nickname,color:p.color,team:p.team,state:p.state,direction:p.direction,score:p.score,id:p.id};}});Object.keys(state.renderPlayers).forEach(id=>{if(!seen.has(id)){delete state.renderPlayers[id];}})}
 function getRenderablePlayers(){return state.players.map(p=>{const ghost=state.renderPlayers[p.id]||{x:p.x,y:p.y,targetX:p.x,targetY:p.y};const follow=0.50;ghost.x += (ghost.targetX-ghost.x)*follow;ghost.y += (ghost.targetY-ghost.y)*follow;state.renderPlayers[p.id]=Object.assign(ghost,{targetX:p.x,targetY:p.y,nickname:p.nickname,color:p.color,team:p.team,state:p.state,direction:p.direction,score:p.score,id:p.id});return {...p,x:ghost.x,y:ghost.y};});}
-function drawScene(){if(state.settings){resizeCanvas();}const hasMaze=(state.mapWalls||[]).length>0;ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,canvas.width,canvas.height);if(state.bgImage&&state.bgImage.complete){ctx.drawImage(state.bgImage,0,0,canvas.width,canvas.height)}else{const bg=ctx.createLinearGradient(0,0,canvas.width,canvas.height);bg.addColorStop(0,'#eaf2ff');bg.addColorStop(.55,'#dbeafe');bg.addColorStop(1,'#cfe2ff');ctx.fillStyle=bg;ctx.fillRect(0,0,canvas.width,canvas.height);ctx.fillStyle='rgba(255,255,255,.30)';ctx.fillRect(14,14,canvas.width-28,canvas.height-28)}drawGrid(hasMaze);drawWalls(state.mapWalls||[]);drawTreasures(state.treasureChests||[]);getRenderablePlayers().forEach(drawPlayer);}
-function renderHud(){const me=state.myPlayer;const teamMode=state.settings&&state.settings.game_mode==='team';const statusText=state.gameStatus==='running'?(me&&me.state==='battling'?'배틀 중':'이동 중'):state.gameStatus==='countdown'?'시작 준비':state.gameStatus==='finished'?'게임 종료':'준비 중';const rank=state.rankings.find(r=>r.player_id===state.playerId)?.rank||'-';topInfo.innerHTML=`<div class="statHero"><span class="mini">${escapeHtml(state.roomTitle||'ReMap')}</span><strong>${escapeHtml(me?me.nickname:'-')}</strong></div>${teamMode?`<div class="rankItem"><span>팀</span><strong>${escapeHtml(me&&me.team?me.team+'팀':'-')}</strong></div>`:''}<div class="rankItem"><span>점수</span><strong>${Number(me?me.score:0)}</strong></div>${me&&Number(me.treasure_score||0)>0?`<div class="rankItem"><span>보물 점수</span><strong>${Number(me.treasure_score||0)}</strong></div>`:''}<div class="rankItem"><span>현재 순위</span><strong>${escapeHtml(rank)}위</strong></div><div class="rankItem"><span>남은 시간</span><strong>${formatTime(state.remainingTime)}</strong></div><div class="rankItem"><span>상태</span><strong>${escapeHtml(statusText)}</strong></div>`;rankingList.innerHTML=state.rankings.length?state.rankings.map(r=>`<div class="rankItem"><span>${Number(r.rank)||'-'}. ${escapeHtml(r.nickname)}${teamMode&&r.team?` <span class=\"mini\">(${escapeHtml(r.team)})</span>`:''}</span><strong>${Number(r.score||0)}</strong></div>`).join(''):'<div class="mini">대기 중</div>';teamRankingList.innerHTML=teamMode?(state.teamRankings.length?state.teamRankings.map(r=>`<div class="rankItem"><span>${Number(r.rank)||'-'}. ${escapeHtml(r.team)}팀</span><strong>${Number(r.score||0)}</strong></div>`).join(''):'<div class="mini">팀 정보 없음</div>'):'<div class="mini">개인전 모드</div>';battleList.innerHTML=state.battles.length?state.battles.map(b=>`<div class="battleItem"><span>${(b.players||[]).map(escapeHtml).join(' vs ')}</span><strong>${Number(b.progress||0)}/${Number(b.total||0)}</strong></div>`).join(''):'<div class="mini">진행 중인 배틀 없음</div>';logList.innerHTML=state.logs.length?state.logs.slice().reverse().map(l=>`<div class="logItem"><span>${escapeHtml(l.time)}</span><span>${escapeHtml(l.message)}</span></div>`).join(''):'<div class="mini">아직 배틀 기록이 없습니다.</div>';}
+function drawScene(){if(state.settings){resizeCanvas();}const hasMaze=(state.mapWalls||[]).length>0;ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,canvas.width,canvas.height);if(state.bgImage&&state.bgImage.complete){ctx.drawImage(state.bgImage,0,0,canvas.width,canvas.height)}else{const bg=ctx.createLinearGradient(0,0,canvas.width,canvas.height);bg.addColorStop(0,'#eaf2ff');bg.addColorStop(.55,'#dbeafe');bg.addColorStop(1,'#cfe2ff');ctx.fillStyle=bg;ctx.fillRect(0,0,canvas.width,canvas.height);ctx.fillStyle='rgba(255,255,255,.30)';ctx.fillRect(14,14,canvas.width-28,canvas.height-28)}drawGrid(hasMaze);drawWalls(state.mapWalls||[]);drawTreasureChests(state.treasureChests||[]);getRenderablePlayers().forEach(drawPlayer);}
+function renderHud(){const me=state.myPlayer;const teamMode=state.settings&&state.settings.game_mode==='team';const statusText=state.gameStatus==='running'?(me&&me.state==='battling'?'배틀 중':'이동 중'):state.gameStatus==='countdown'?'시작 준비':state.gameStatus==='finished'?'게임 종료':'준비 중';const rank=state.rankings.find(r=>r.player_id===state.playerId)?.rank||'-';topInfo.innerHTML=`<div class="statHero"><span class="mini">${escapeHtml(state.roomTitle||'ReMap')}</span><strong>${escapeHtml(me?me.nickname:'-')}</strong></div>${teamMode?`<div class="rankItem"><span>팀</span><strong>${escapeHtml(me&&me.team?me.team+'팀':'-')}</strong></div>`:''}<div class="rankItem"><span>점수</span><strong>${Number(me?me.score:0)}</strong></div><div class="rankItem"><span>현재 순위</span><strong>${escapeHtml(rank)}위</strong></div><div class="rankItem"><span>남은 시간</span><strong>${formatTime(state.remainingTime)}</strong></div><div class="rankItem"><span>상태</span><strong>${escapeHtml(statusText)}</strong></div>`;rankingList.innerHTML=state.rankings.length?state.rankings.map(r=>`<div class="rankItem"><span>${Number(r.rank)||'-'}. ${escapeHtml(r.nickname)}${teamMode&&r.team?` <span class=\"mini\">(${escapeHtml(r.team)})</span>`:''}</span><strong>${Number(r.score||0)}</strong></div>`).join(''):'<div class="mini">대기 중</div>';teamRankingList.innerHTML=teamMode?(state.teamRankings.length?state.teamRankings.map(r=>`<div class="rankItem"><span>${Number(r.rank)||'-'}. ${escapeHtml(r.team)}팀</span><strong>${Number(r.score||0)}</strong></div>`).join(''):'<div class="mini">팀 정보 없음</div>'):'<div class="mini">개인전 모드</div>';battleList.innerHTML=state.battles.length?state.battles.map(b=>`<div class="battleItem"><span>${(b.players||[]).map(escapeHtml).join(' vs ')}</span><strong>${Number(b.progress||0)}/${Number(b.total||0)}</strong></div>`).join(''):'<div class="mini">진행 중인 배틀 없음</div>';logList.innerHTML=state.logs.length?state.logs.slice().reverse().map(l=>`<div class="logItem"><span>${escapeHtml(l.time)}</span><span>${escapeHtml(l.message)}</span></div>`).join(''):'<div class="mini">아직 배틀 기록이 없습니다.</div>';}
 function render(){drawScene();renderHud();}
 function drawGrid(hasMaze=false){ctx.strokeStyle=hasMaze?'rgba(37,99,235,0.06)':'rgba(37,99,235,0.08)';for(let x=0;x<canvas.width;x+=50){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,canvas.height);ctx.stroke()}for(let y=0;y<canvas.height;y+=50){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(canvas.width,y);ctx.stroke()}}
 
@@ -4160,7 +4148,7 @@ function lightenColor(hex, factor=0.18){const {r,g,b}=hexToRgb(hex);return `rgb(
 function alphaColor(hex, alpha){const {r,g,b}=hexToRgb(hex);return `rgba(${r},${g},${b},${alpha})`;}
 const playerMascotCache={};
 function getPlayerMascot(color){const key=normalizeCharacterColor(color);if(!playerMascotCache[key]){const img=new Image();img.onload=()=>render();img.onerror=()=>{playerMascotCache[key]=null;};img.src=buildCharacterSvgUrl(key);playerMascotCache[key]=img;}return playerMascotCache[key];}
-function drawTreasures(chests){const me=state.myPlayer;const done=new Set((me&&me.treasures_done)||[]);(chests||[]).forEach(ch=>{const x=Number(ch.x||0),y=Number(ch.y||0);if(!x&&!y)return;const opened=done.has(String(ch.id));ctx.save();ctx.translate(x,y);ctx.globalAlpha=opened?0.46:1;ctx.font='30px Arial';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(opened?'🪙':'🎁',0,0);ctx.font='bold 11px Arial';ctx.fillStyle=opened?'#64748b':'#92400e';ctx.fillText('+'+Number(ch.score||0),0,24);ctx.restore();});}
+function drawTreasureChests(chests){const solvedIds=new Set((state.myPlayer&&state.myPlayer.treasure_solved_ids)||[]);(chests||[]).forEach(ch=>{const x=Number(ch.x||0),y=Number(ch.y||0);if(!x||!y)return;const solved=solvedIds.has(ch.id);ctx.save();ctx.translate(x,y);ctx.globalAlpha=solved?0.46:1;ctx.shadowColor=solved?'rgba(100,116,139,.18)':'rgba(146,64,14,.28)';ctx.shadowBlur=solved?3:10;ctx.shadowOffsetY=3;ctx.fillStyle=solved?'#64748b':'#b45309';ctx.fillRect(-15,-8,30,22);ctx.fillStyle=solved?'#cbd5e1':'#fbbf24';ctx.fillRect(-13,-6,26,18);ctx.fillStyle=solved?'#475569':'#92400e';ctx.fillRect(-16,-16,32,12);ctx.fillStyle=solved?'#e2e8f0':'#fde68a';ctx.fillRect(-13,-13,26,5);ctx.fillStyle=solved?'#334155':'#78350f';ctx.fillRect(-2,-16,4,34);ctx.fillStyle=solved?'#f8fafc':'#fef3c7';ctx.beginPath();ctx.arc(0,2,4,0,Math.PI*2);ctx.fill();ctx.fillStyle=solved?'#334155':'#78350f';ctx.font='bold 10px Arial';ctx.textAlign='center';ctx.fillText(solved?'✓':String(ch.index||''),0,5);ctx.restore();});}
 function drawPlayer(p){const size=30;const originalColor=p.color||'#60a5fa';const isMe=!!state.playerId&&p.id===state.playerId;const alreadyBattled=!isMe&&Array.isArray(p.battled_ids)&&p.battled_ids.includes(state.playerId);const bodyColor=alreadyBattled?'#94a3b8':originalColor;const mascot=getPlayerMascot(bodyColor);ctx.save();if(p.connected===false){ctx.globalAlpha=0.32}else if(p.connected===false){ctx.globalAlpha=0.32}else if(p.state==='battling'){ctx.globalAlpha=0.45}ctx.translate(p.x,p.y);if(isMe){ctx.save();ctx.globalAlpha=0.96;ctx.shadowColor='rgba(250,204,21,0.86)';ctx.shadowBlur=24;ctx.fillStyle='rgba(250,204,21,0.28)';ctx.beginPath();ctx.arc(0,0,size/2+13,0,Math.PI*2);ctx.fill();ctx.restore();}ctx.shadowColor='rgba(15,23,42,0.18)';ctx.shadowBlur=4;ctx.shadowOffsetY=1;if(mascot&&mascot.complete&&mascot.naturalWidth>0){ctx.drawImage(mascot,-size/2,-size/2,size,size);}else{ctx.fillStyle=bodyColor;ctx.beginPath();ctx.arc(0,0,size/2.4,0,Math.PI*2);ctx.fill();}ctx.shadowColor='transparent';if(alreadyBattled){ctx.save();ctx.lineWidth=1.8;ctx.strokeStyle='rgba(71,85,105,.72)';ctx.beginPath();ctx.arc(0,0,size/2+3,0,Math.PI*2);ctx.stroke();ctx.restore();}if(p.state==='battling'){ctx.beginPath();ctx.arc(0,0,size/2+4.8,0,Math.PI*2);ctx.strokeStyle='rgba(239,68,68,0.85)';ctx.lineWidth=2;ctx.stroke();}ctx.restore();ctx.fillStyle=isMe?'#92400e':'#173b7a';ctx.font=isMe?'bold 12px Arial':'12px Arial';ctx.textAlign='center';const teamLabel=(state.settings&&state.settings.game_mode==='team'&&p.team)?` [${p.team}]`:'';ctx.fillText(`${p.nickname}${teamLabel}`,p.x,p.y-24)}
 function roundRect(x,y,w,h,r,fill,stroke){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();if(fill)ctx.fill();if(stroke)ctx.stroke()}
 function gameLoop(ts=0){if(!state.gameLoopRunning){state.animationFrameId=null;return;}if(!state.lastFrameTs)state.lastFrameTs=ts;state.lastFrameTs=ts;if(gameScreen.style.display==='grid'){drawScene();}if(state.socket&&state.socket.readyState===1&&gameScreen.style.display==='grid'&&state.gameStatus!=='finished'&&state.gameStatus!=='countdown'){let dx=0,dy=0;if(state.keys['arrowleft']||state.keys['a']||state.keys['KeyA'])dx-=1;if(state.keys['arrowright']||state.keys['d']||state.keys['KeyD'])dx+=1;if(state.keys['arrowup']||state.keys['w']||state.keys['KeyW'])dy-=1;if(state.keys['arrowdown']||state.keys['s']||state.keys['KeyS'])dy+=1;if(state.touchDx||state.touchDy){dx=state.touchDx;dy=state.touchDy;}else{const len=Math.hypot(dx,dy);if(len>1){dx/=len;dy/=len;}}if(dx||dy){const now=performance.now?performance.now():Date.now();const moveInterval=1000/30;if(!state.lastMoveSentAt||now-state.lastMoveSentAt>=moveInterval){state.lastMoveSentAt=now;state.socket.send(JSON.stringify({type:'move',dx:Number(dx.toFixed(3)),dy:Number(dy.toFixed(3))}))}}else{state.lastMoveSentAt=0;}}state.animationFrameId=requestAnimationFrame(gameLoop)}
@@ -4168,12 +4156,12 @@ window.addEventListener('keydown',e=>{const k=(e.key||'').toLowerCase();if(k)sta
 function setBattleProgress(index,total){const pct=total?Math.max(0,Math.min(100,((index-1)/total)*100)):0;if(battleProgressFill)battleProgressFill.style.width=pct+'%'}
 function showBattleIntro(msg){battleOverlay.style.display='flex';battleCard.className='intro';battleTitle.textContent='배틀 시작';battleMeta.textContent='잠시 후 문제가 나타납니다';battleTimer.textContent='VS';setBattleProgress(1,1);battleQuestion.className='battleVsStage';battleQuestion.innerHTML=`<div class="battleVsText">${escapeHtml(msg.me)} <span style="opacity:.72">VS</span> ${escapeHtml(msg.opponent)}</div><div class="battleVsSub">상대가 낸 문제를 풀어 승부를 겨뤄요</div>`;battleChoices.innerHTML='';clearInterval(state.timerHandle);state.lastBattleIntroTs=Date.now();}
 function startBattleQuestion(msg){const waitAfterIntro=Math.max(0,850-(Date.now()-(state.lastBattleIntroTs||0)));const waitAfterFeedback=Math.max(0,620-(Date.now()-(state.lastFeedbackTs||0)));const delay=Math.max(waitAfterIntro,waitAfterFeedback);if(delay>0){setTimeout(()=>startBattleQuestion(msg),delay);return;}state.currentBattle={battleId:msg.battle_id,index:msg.index,total:msg.total,remaining:msg.time_limit,startTs:Date.now(),answered:false};battleOverlay.style.display='flex';battleCard.className='';battleQuestion.className='battleQuestionBox';battleTitle.textContent=`${msg.opponent} 와 퀴즈 배틀`;battleMeta.textContent=`${msg.index}/${msg.total} 문제`;setBattleProgress(msg.index,msg.total);battleQuestion.textContent=msg.question.text;battleChoices.innerHTML='';msg.question.choices.forEach((c,i)=>{const btn=document.createElement('button');btn.className='choice';btn.dataset.index=String(i);btn.textContent=`${i+1}. ${c}`;btn.onclick=()=>submitAnswer(i);battleChoices.appendChild(btn)});updateBattleTimer();clearInterval(state.timerHandle);state.timerHandle=setInterval(()=>{if(!state.currentBattle)return;state.currentBattle.remaining-=1;updateBattleTimer();if(state.currentBattle.remaining<=0){clearInterval(state.timerHandle)}},1000)}
-function startTreasureQuestion(msg){state.currentBattle={battleId:msg.chest_id,chestId:msg.chest_id,isTreasure:true,index:1,total:1,remaining:msg.time_limit,startTs:Date.now(),answered:false};battleOverlay.style.display='flex';battleCard.className='';battleQuestion.className='battleQuestionBox';battleTitle.textContent='보물상자 문제';battleMeta.textContent=`${escapeHtml(msg.label||'보물상자')} · +${Number(msg.score||0)}점`;setBattleProgress(1,1);battleQuestion.textContent=msg.question.text;battleChoices.innerHTML='';msg.question.choices.forEach((c,i)=>{const btn=document.createElement('button');btn.className='choice';btn.dataset.index=String(i);btn.textContent=`${i+1}. ${c}`;btn.onclick=()=>submitAnswer(i);battleChoices.appendChild(btn)});updateBattleTimer();clearInterval(state.timerHandle);state.timerHandle=setInterval(()=>{if(!state.currentBattle)return;state.currentBattle.remaining-=1;updateBattleTimer();if(state.currentBattle.remaining<=0){clearInterval(state.timerHandle)}},1000)}
+function startTreasureQuestion(msg){state.currentBattle={mode:'treasure',chestId:msg.chest_id,index:1,total:1,remaining:msg.time_limit,startTs:Date.now(),answered:false};battleOverlay.style.display='flex';battleCard.className='';battleQuestion.className='battleQuestionBox';battleTitle.textContent='🎁 보물상자 문제';battleMeta.textContent=`보물상자 ${Number(msg.index)||''} · ${Number(msg.score||0)}점`;setBattleProgress(1,1);battleQuestion.textContent=msg.question.text;battleChoices.innerHTML='';msg.question.choices.forEach((c,i)=>{const btn=document.createElement('button');btn.className='choice';btn.dataset.index=String(i);btn.textContent=`${i+1}. ${c}`;btn.onclick=()=>submitAnswer(i);battleChoices.appendChild(btn)});updateBattleTimer();clearInterval(state.timerHandle);state.timerHandle=setInterval(()=>{if(!state.currentBattle)return;state.currentBattle.remaining-=1;updateBattleTimer();if(state.currentBattle.remaining<=0){clearInterval(state.timerHandle)}},1000)}
 function updateBattleTimer(){const remain=state.currentBattle?.remaining ?? 0;battleTimer.textContent=`⏱ ${remain}초`;if(state.currentBattle&&state.currentBattle.total){setBattleProgress(state.currentBattle.index,state.currentBattle.total)}}
-function submitAnswer(selected){if(!state.currentBattle||!state.socket||state.currentBattle.answered)return;state.currentBattle.answered=true;const timeUsed=Math.min(state.settings.question_time_limit,Math.round((Date.now()-state.currentBattle.startTs)/1000));battleChoices.querySelectorAll('.choice').forEach(btn=>{btn.classList.add('locked');btn.disabled=true;if(Number(btn.dataset.index)===selected)btn.classList.add('selected');});if(state.currentBattle.isTreasure){state.socket.send(JSON.stringify({type:'treasure_answer',chest_id:state.currentBattle.chestId,selected,time_used:timeUsed}));}else{state.socket.send(JSON.stringify({type:'answer',battle_id:state.currentBattle.battleId,selected,time_used:timeUsed}));}battleMeta.textContent='채점 중...';}
+function submitAnswer(selected){if(!state.currentBattle||!state.socket||state.currentBattle.answered)return;state.currentBattle.answered=true;const timeUsed=Math.min(state.settings.question_time_limit,Math.round((Date.now()-state.currentBattle.startTs)/1000));battleChoices.querySelectorAll('.choice').forEach(btn=>{btn.classList.add('locked');btn.disabled=true;if(Number(btn.dataset.index)===selected)btn.classList.add('selected');});if(state.currentBattle.mode==='treasure'){state.socket.send(JSON.stringify({type:'treasure_answer',chest_id:state.currentBattle.chestId,selected,time_used:timeUsed}));}else{state.socket.send(JSON.stringify({type:'answer',battle_id:state.currentBattle.battleId,selected,time_used:timeUsed}));}battleMeta.textContent='채점 중...';}
 function showAnswerFeedback(msg){state.lastFeedbackTs=Date.now();const selected=msg.selected;battleChoices.querySelectorAll('.choice').forEach(btn=>{const idx=Number(btn.dataset.index);if(selected!==null&&idx===Number(selected)){btn.classList.remove('selected');btn.classList.add(msg.correct?'correct':'wrong');}});battleEffect.textContent=msg.timed_out?'시간 초과!':msg.correct?'정답!':'오답!';battleEffect.className=msg.correct?'success':'error';if(state.effectTimer)clearTimeout(state.effectTimer);state.effectTimer=setTimeout(()=>{battleEffect.style.display='none';battleEffect.className='';},650);}
 function showBattleResult(msg){clearTimeout(state.autoResultHide);resultOverlay.style.display='flex';resultCard.className='resultCard '+(msg.result==='win'?'win':msg.result==='lose'?'lose':'draw');resultTitle.textContent=msg.result==='win'?'승리!':msg.result==='lose'?'패배':'무승부';resultText.innerHTML=`상대: <strong>${escapeHtml(msg.opponent)}</strong><br>내 정답: ${Number(msg.my_correct||0)} / 상대 정답: ${Number(msg.opponent_correct||0)}<br>현재 점수: <strong>${Number(msg.my_score||0)}</strong>`;battleOverlay.style.display='none';battleEffect.style.display='none';battleEffect.className='';state.currentBattle=null;resultConfirmBtn.onclick=()=>{resultOverlay.style.display='none'};state.autoResultHide=setTimeout(()=>{resultOverlay.style.display='none'},2800)}
-function showTreasureResult(msg){clearTimeout(state.autoResultHide);const selected=msg.selected;battleChoices.querySelectorAll('.choice').forEach(btn=>{const idx=Number(btn.dataset.index);btn.disabled=true;btn.classList.add('locked');if(selected!==null&&idx===Number(selected)){btn.classList.add(msg.correct?'correct':'wrong');}});setTimeout(()=>{resultOverlay.style.display='flex';resultCard.className='resultCard '+(msg.correct?'win':'lose');resultTitle.textContent=msg.correct?'보물 획득!':'보물 도전 완료';resultText.innerHTML=msg.correct?`보물상자 점수 <strong>+${Number(msg.gained_score||0)}</strong>점을 얻었어요.<br>현재 점수: <strong>${Number(msg.my_score||0)}</strong>`:(msg.timed_out?'시간 초과! 다음 보물상자를 찾아보세요.':'아쉬워요. 다음 보물상자를 찾아보세요.');battleOverlay.style.display='none';state.currentBattle=null;resultConfirmBtn.onclick=()=>{resultOverlay.style.display='none'};state.autoResultHide=setTimeout(()=>{resultOverlay.style.display='none'},2200)},450)}
+function showTreasureResult(msg){clearTimeout(state.autoResultHide);resultOverlay.style.display='flex';resultCard.className='resultCard '+(msg.correct?'win':'draw');resultTitle.textContent=msg.correct?'보물 획득!':'보물 도전 완료';const line=msg.correct?`+${Number(msg.points||0)}점 획득`:(msg.timed_out?'시간 초과':'정답: '+escapeHtml(msg.answer_text||''));resultText.innerHTML=`보물상자 ${Number(msg.chest_index)||''}<br><strong>${line}</strong><br>현재 점수: <strong>${Number(msg.score||0)}</strong>`;battleOverlay.style.display='none';battleEffect.style.display='none';battleEffect.className='';state.currentBattle=null;resultConfirmBtn.onclick=()=>{resultOverlay.style.display='none'};state.autoResultHide=setTimeout(()=>{resultOverlay.style.display='none'},2600)}
 function escapeHtml(value){return String(value??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]))}
 function ordinalMedal(rank){return rank===1?'🥇':rank===2?'🥈':rank===3?'🥉':'🏅'}
 function normalizeCharacterColor(color){const raw=String(color||'').trim();const cleaned=raw.replace(/[^0-9a-fA-F]/g,'');if(cleaned.length===3){return cleaned.split('').map(ch=>ch+ch).join('').toLowerCase();}if(cleaned.length>=6){return cleaned.slice(0,6).toLowerCase();}return '60a5fa';}
@@ -5023,7 +5011,7 @@ button.soft{
 #createScreen .teacherMusicPanel{justify-content:flex-end;color:#dbeafe;background:rgba(255,255,255,.055)}
 .musicToggleBtn{width:auto!important;min-height:34px!important;padding:8px 12px!important;border-radius:999px!important;background:linear-gradient(135deg,#0ea5e9,#2563eb)!important;color:#fff!important;font-size:13px!important;font-weight:1000!important;box-shadow:0 12px 24px rgba(37,99,235,.18)!important}
 .musicToggleBtn.off{background:linear-gradient(135deg,#64748b,#334155)!important;box-shadow:none!important;color:#e2e8f0!important}
-.musicVolumeLabel{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:900;color:#d9efff;white-space:nowrap}.musicVolumeLabel input{width:96px;accent-color:#38bdf8}.musicHint{font-size:11px;color:#b9d3ee;font-weight:800;min-width:72px;text-align:right}
+.musicVolumeLabel{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:900;color:#d9efff;white-space:nowrap;min-width:160px}.musicVolumeLabel input{width:128px!important;min-width:128px;margin:0!important;padding:0!important;display:block;accent-color:#38bdf8}.musicHint{font-size:11px;color:#b9d3ee;font-weight:800;min-width:72px;text-align:right}
 @media(max-width:760px){.teacherMusicPanel{justify-content:center!important;gap:8px;margin-top:8px;padding:8px}.musicToggleBtn{font-size:12px!important;padding:7px 10px!important}.musicVolumeLabel input{width:82px}.musicHint{width:100%;text-align:center;font-size:10px}}
 @media(max-width:820px) and (orientation:landscape){#operateScreen .teacherMusicPanel{margin-top:7px;padding:7px 8px;justify-content:flex-start!important}.musicHint{display:none}.musicVolumeLabel input{width:74px}}
 
@@ -5088,10 +5076,6 @@ button.soft{
   }
 }
 
-
-/* ===== v3.38 treasure chest mode ===== */
-.treasureBox{border:1px solid rgba(251,191,36,.30);background:linear-gradient(180deg,rgba(251,191,36,.13),rgba(255,255,255,.055));border-radius:18px;padding:12px;margin-top:10px}.treasureToggleRow{display:flex;align-items:center;justify-content:space-between;gap:12px}.treasureToggleRow b{color:#fff}.treasureSwitch{display:inline-flex;align-items:center;gap:8px;font-weight:1000;color:#eaf6ff}.treasureSwitch input{width:20px;height:20px;accent-color:#f59e0b}.treasureEditor{display:none;margin-top:10px}.treasureEditor.on{display:block}.treasureCountRow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:end;margin-bottom:8px}.treasureCountRow input{min-height:38px!important}.treasureQuestions{display:grid;gap:10px;max-height:360px;overflow:auto;padding-right:2px}.treasureQuestionCard{border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:10px;background:rgba(15,23,42,.16)}.treasureQuestionCard h4{margin:0 0 8px;color:#fff}.treasureQuestionCard textarea{width:100%;min-height:56px}.treasureChoiceRow{display:grid;grid-template-columns:30px minmax(0,1fr) 84px;gap:7px;align-items:center;margin-top:6px}.treasureChoiceRow .choiceBadge{display:flex;align-items:center;justify-content:center;border-radius:999px;background:rgba(255,255,255,.12);color:#fff;font-weight:1000}.treasureScoreRow{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}.treasureProgressItem{display:flex;justify-content:space-between;gap:8px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.08)}.treasureProgressItem:last-child{border-bottom:none}.treasureMapZoom{position:absolute;right:10px;bottom:10px;z-index:5;display:flex;gap:5px;align-items:center;background:rgba(15,23,42,.72);border:1px solid rgba(255,255,255,.16);border-radius:999px;padding:5px 7px;color:#fff;font-size:12px;font-weight:900}.treasureMapZoom button{width:28px!important;height:28px!important;min-height:28px!important;padding:0!important;border-radius:999px!important;background:rgba(255,255,255,.12)!important;color:#fff!important;box-shadow:none!important}@media(max-width:820px){.treasureQuestions{max-height:260px}.treasureCountRow{grid-template-columns:1fr}.treasureScoreRow{grid-template-columns:1fr 1fr}.treasureChoiceRow{grid-template-columns:26px minmax(0,1fr) 76px}}
-
 </style>
 </head>
 <body>
@@ -5109,7 +5093,7 @@ button.soft{
       <div class='field'><label>게임 모드</label><input id='game_mode' type='hidden' value='solo'><div class='modeButtons'><button type='button' class='modeBtn active' data-mode='solo'>개인전</button><button type='button' class='modeBtn' data-mode='team'>팀전</button></div></div>
       <div id='teamCountWrap' class='field'><label>팀 수</label><input id='team_count' type='number' min='2' max='5' value='4'></div>
       <div class='field full'><label>맵 종류</label><input id='map_type' type='hidden' value='open'><div class='mapButtons'><button type='button' class='mapBtn active' data-map='open'>오픈 스퀘어<small>넓은 자유 이동형</small></button><button type='button' class='mapBtn' data-map='maze'>미로형 맵<small>벽을 피해 만나는 구조</small></button></div></div>
-      <div class='field full treasureBox'><div class='treasureToggleRow'><div><b>추가 모드</b><div class='mini'>교사가 만든 핵심 문제를 맵 안의 보물상자로 배치합니다.</div></div><label class='treasureSwitch'><input id='treasure_enabled' type='checkbox'> 보물상자 문제 ON</label></div><div id='treasureEditor' class='treasureEditor'><div class='treasureCountRow'><div class='field'><label>보물 문제 수</label><input id='treasure_count' type='number' min='1' max='20' value='3'></div><button id='treasureBuildBtn' type='button' class='soft'>문제 칸 만들기</button></div><div id='treasureQuestions' class='treasureQuestions'></div></div></div>
+      <div class='field full treasureModeBox'><label>추가 모드</label><div class='treasureToggleRow'><label class='treasureToggleLabel'><input id='treasure_enabled' type='checkbox'> 보물상자 문제 ON</label><div class='treasureHint'>교사가 낸 핵심 문제를 맵에 보물상자로 배치합니다. 모든 학생이 각 상자를 1번씩 풀 수 있습니다.</div></div><div id='treasureConfig' class='treasureConfig'><div class='treasureTopRow'><div class='field'><label>보물 문제 수</label><input id='treasure_count' type='number' min='1' max='12' value='1'></div><div class='treasureHint'>정답 시 보물 점수가 총점에 더해집니다. 보물상자는 방 생성 시 랜덤 위치에 고정됩니다.</div></div><div id='treasureEditor' class='treasureEditor'></div></div></div>
       <div class='helpBox full teamFixedBox'><b>팀전 색상 고정</b><div class='teamLegend'><span class='teamChip team-A'>A 파랑</span><span class='teamChip team-B'>B 빨강</span><span class='teamChip team-C'>C 노랑</span><span class='teamChip team-D'>D 초록</span><span class='teamChip team-E'>E 회색</span></div></div>
       <div class='row full teacherSettingsGrid'>
         <div class='field'><label>배틀 문제 수</label><input id='question_count' type='number' min='1' value='1'></div>
@@ -5124,13 +5108,13 @@ button.soft{
         <div class='field'><label>배경 이미지</label><input id='bgFile' type='file' accept='image/*'></div>
       </div>
     </div>
-    <div class='createActions'><button id='createBtn'>방 생성</button><button id='clearBgPreBtn' type='button' class='ghost'>기본 배경 복원</button></div><div class='teacherMusicPanel' aria-label='교사용 음악 모드'><button type='button' class='musicToggleBtn'>🎵 음악모드 ON</button><label class='musicVolumeLabel'>음량 <input type='range' class='musicVolume' min='0' max='100' value='35'></label><span class='musicHint'>교사 화면에서만 재생</span></div><div class='teacherCredit'><div>만든이: 서울시교육청 교사 김철원</div><div>문의: churwon@sen.go.kr</div></div>
+    <div class='createActions'><button id='createBtn'>방 생성</button><button id='clearBgPreBtn' type='button' class='ghost'>기본 배경 복원</button></div><div class='teacherMusicPanel' aria-label='교사용 음악 모드'><button type='button' class='musicToggleBtn off'>🔇 음악모드 OFF</button><label class='musicVolumeLabel'>음량 <input type='range' class='musicVolume' min='0' max='100' value='35'></label><span class='musicHint'>교사 화면에서만 재생</span></div><div class='teacherCredit'><div>만든이: 서울시교육청 교사 김철원</div><div>문의: churwon@sen.go.kr</div></div>
   </div>
 </section>
 <section id='operateScreen'>
   <div class='opHeader'>
     <div class='panel codeBox'><div class='codeTextBlock'><div class='mini'>학생 입장 코드</div><div id='codeValue' class='codeValue'>----</div><div id='studentJoinUrl' class='joinUrl'>학생 접속 주소 준비 중</div></div><div class='qrPanel'><img id='joinQr' class='joinQr' alt='학생 입장 QR 코드'><div class='qrCaption'>스마트폰 카메라로 스캔</div></div></div>
-    <div class='panel summaryPanel'><div class='headerMeta'><div class='miniCard primary'><span class='mini'>상태</span><strong id='stateValue'>준비 중</strong></div><div class='miniCard compact'><span class='mini'>참가자</span><strong id='playerCountValue'>0명</strong></div><div class='miniCard primary'><span class='mini'>남은 시간</span><strong id='remainValue'>3:00</strong></div><div class='miniCard compact'><span class='mini'>팀별 인원</span><strong id='teamCountValue'>-</strong></div><div class='miniCard compact'><span class='mini'>미제출</span><strong id='unsubmittedValue'>0명</strong></div></div><div class='opButtons' id='opButtons'><button id='startBtn'>게임 시작</button><button id='endBtn' class='danger'>게임 종료</button><button id='ceremonyBtn' class='ceremonyBtn' type='button'>시상식 보기</button><button id='resetBtn' class='ghost'>다음 게임 준비</button><button id='exportQuestionsBtn' class='soft'>문제 엑셀 다운로드</button><button id='aiReviewBtn' class='soft' type='button'>AI 문제 검토</button><button id='newRoomBtn' class='soft'>새 방 설정</button></div><div class='teacherMusicPanel' aria-label='교사용 음악 모드'><button type='button' class='musicToggleBtn'>🎵 음악모드 ON</button><label class='musicVolumeLabel'>음량 <input type='range' class='musicVolume' min='0' max='100' value='35'></label><span class='musicHint'>교사 화면에서만 재생</span></div></div>
+    <div class='panel summaryPanel'><div class='headerMeta'><div class='miniCard primary'><span class='mini'>상태</span><strong id='stateValue'>준비 중</strong></div><div class='miniCard compact'><span class='mini'>참가자</span><strong id='playerCountValue'>0명</strong></div><div class='miniCard primary'><span class='mini'>남은 시간</span><strong id='remainValue'>3:00</strong></div><div class='miniCard compact'><span class='mini'>팀별 인원</span><strong id='teamCountValue'>-</strong></div><div class='miniCard compact'><span class='mini'>미제출</span><strong id='unsubmittedValue'>0명</strong></div></div><div class='opButtons' id='opButtons'><button id='startBtn'>게임 시작</button><button id='endBtn' class='danger'>게임 종료</button><button id='ceremonyBtn' class='ceremonyBtn' type='button'>시상식 보기</button><button id='resetBtn' class='ghost'>다음 게임 준비</button><button id='exportQuestionsBtn' class='soft'>문제 엑셀 다운로드</button><button id='aiReviewBtn' class='soft' type='button'>AI 문제 검토</button><button id='newRoomBtn' class='soft'>새 방 설정</button></div><div class='teacherMusicPanel' aria-label='교사용 음악 모드'><button type='button' class='musicToggleBtn off'>🔇 음악모드 OFF</button><label class='musicVolumeLabel'>음량 <input type='range' class='musicVolume' min='0' max='100' value='35'></label><span class='musicHint'>교사 화면에서만 재생</span></div></div>
   </div>
   <div class='opMain'>
     <div class='col leftCol'>
@@ -5146,8 +5130,8 @@ button.soft{
     <div class='col rightCol'>
       <div class='panel'><h3 class='sectionTitle'>개인 순위</h3><div id='rankingBox'></div></div>
       <div class='panel'><h3 class='sectionTitle'>팀 순위</h3><div id='teamRankingBox'></div></div>
-      <div class='panel'><h3 class='sectionTitle'>보물상자 현황</h3><div id='treasureProgressBox'><div class='mini'>보물상자 문제 OFF</div></div></div>
       <div class='panel'><h3 class='sectionTitle'>배틀 진행률</h3><div id='battleBox'></div></div>
+      <div class='panel treasureSummaryPanel'><h3 class='sectionTitle'>보물상자 현황</h3><div id='treasureSummaryBox'><div class='mini'>보물상자 모드를 켜면 풀이 현황이 표시됩니다.</div></div></div>
       <div class='panel aiReviewPanel'><h3 class='sectionTitle'>AI 문제 검토</h3><div class='mini'>AI는 최종 판정이 아니라 교사용 참고 의견만 표시합니다.</div><div id='aiReviewBox' class='aiReviewBox'><div class='mini'>[AI 문제 검토] 버튼을 누르면 학생 제출 문제를 검토합니다.</div></div></div><div class='panel'><h3 class='sectionTitle'>로그</h3><div id='logBox'></div></div>
     </div>
   </div>
@@ -5165,9 +5149,9 @@ button.soft{
 <script>
 let bgDataUrl=null,currentState=null,editingRoom=false,lastGameEndPayload=null;
 const createScreen=document.getElementById('createScreen'),operateScreen=document.getElementById('operateScreen');
-const statusBar=document.getElementById('statusBar'),roomTitleBar=document.getElementById('roomTitleBar'),roomBox=document.getElementById('roomBox'),participantBox=document.getElementById('participantBox'),rankingBox=document.getElementById('rankingBox'),teamRankingBox=document.getElementById('teamRankingBox'),battleBox=document.getElementById('battleBox'),treasureProgressBox=document.getElementById('treasureProgressBox'),logBox=document.getElementById('logBox'),aiReviewBox=document.getElementById('aiReviewBox');
+const statusBar=document.getElementById('statusBar'),roomTitleBar=document.getElementById('roomTitleBar'),roomBox=document.getElementById('roomBox'),participantBox=document.getElementById('participantBox'),rankingBox=document.getElementById('rankingBox'),teamRankingBox=document.getElementById('teamRankingBox'),battleBox=document.getElementById('battleBox'),logBox=document.getElementById('logBox'),aiReviewBox=document.getElementById('aiReviewBox');
 const teacherMusic={
-  enabled: localStorage.getItem('remapTeacherMusicMode')!=='off',
+  enabled: localStorage.getItem('remapTeacherMusicMode')==='on',
   volume: Math.max(0,Math.min(1,Number(localStorage.getItem('remapTeacherMusicVolume')||'0.35'))),
   current:null,
   lastPhase:null,
@@ -5184,7 +5168,7 @@ function updateMusicControls(message){
   document.querySelectorAll('.musicToggleBtn').forEach(btn=>{btn.textContent=teacherMusic.enabled?'🎵 음악모드 ON':'🔇 음악모드 OFF';btn.classList.toggle('off',!teacherMusic.enabled);});
   document.querySelectorAll('.musicVolume').forEach(sl=>{sl.value=String(Math.round(teacherMusic.volume*100));});
   if(message){document.querySelectorAll('.musicHint').forEach(el=>{el.textContent=message;});}
-  else{document.querySelectorAll('.musicHint').forEach(el=>{el.textContent='교사 화면에서만 재생';});}
+  else{document.querySelectorAll('.musicHint').forEach(el=>{el.textContent=teacherMusic.enabled?'교사 화면에서만 재생':'음악모드 버튼을 누르면 재생';});}
 }
 function setTeacherMusicVolume(value){teacherMusic.volume=Math.max(0,Math.min(1,Number(value)/100));localStorage.setItem('remapTeacherMusicVolume',String(teacherMusic.volume));Object.values(teacherMusicTracks).forEach(a=>a.volume=teacherMusic.volume);updateMusicControls();}
 function stopTeacherMusic(){Object.values(teacherMusicTracks).forEach(a=>{try{a.pause();a.currentTime=0;}catch(e){}});teacherMusic.current=null;}
@@ -5232,42 +5216,16 @@ applyTeacherMapScale();
 const ids=['room_title','teacher_owner','game_mode','team_count','map_type','question_count','question_time_limit','total_game_time','map_width','map_height','player_speed','score_win','score_draw','score_lose'];
 const gameModeSelect=document.getElementById('game_mode');const mapTypeSelect=document.getElementById('map_type');const teamCountWrap=document.getElementById('teamCountWrap');
 const modeButtons=[...document.querySelectorAll('.modeBtn')];const mapButtons=[...document.querySelectorAll('.mapBtn')];
+const treasureEnabledInput=document.getElementById('treasure_enabled'),treasureConfig=document.getElementById('treasureConfig'),treasureCountInput=document.getElementById('treasure_count'),treasureEditor=document.getElementById('treasureEditor'),treasureSummaryBox=document.getElementById('treasureSummaryBox');
+const treasureDraft=[];
+function ensureTreasureDraftCount(){const count=Math.max(1,Math.min(12,Number(treasureCountInput?.value||1)));while(treasureDraft.length<count){treasureDraft.push({text:'',choices:['','','',''],answer:0,score:5});}if(treasureDraft.length>count)treasureDraft.length=count;}
+function renderTreasureEditor(){if(!treasureEditor||!treasureConfig)return;const enabled=!!treasureEnabledInput?.checked;treasureConfig.classList.toggle('active',enabled);if(!enabled){treasureEditor.innerHTML='';return;}ensureTreasureDraftCount();treasureEditor.innerHTML=treasureDraft.map((q,idx)=>`<div class='treasureItem'><div class='treasureItemHeader'><span>🎁 보물상자 ${idx+1}</span><span class='mini'>교사 출제</span></div><textarea data-treasure-field='text' data-idx='${idx}' placeholder='보물상자 문제를 입력하세요'>${escapeHtml(q.text||'')}</textarea><div class='treasureChoices'>${['①','②','③','④'].map((n,i)=>`<input data-treasure-field='choice' data-idx='${idx}' data-cidx='${i}' placeholder='${n} 선택지' value='${escapeHtml(q.choices[i]||'')}'>`).join('')}</div><div class='treasureMetaGrid'><div><label class='mini'>정답</label><select data-treasure-field='answer' data-idx='${idx}'>${[0,1,2,3].map(i=>`<option value='${i}' ${q.answer===i?'selected':''}>${['①','②','③','④'][i]}</option>`).join('')}</select></div><div><label class='mini'>점수</label><input data-treasure-field='score' data-idx='${idx}' type='number' min='1' max='50' value='${Number(q.score||5)}'></div></div></div>`).join('');treasureEditor.querySelectorAll('[data-treasure-field]').forEach(el=>{el.oninput=el.onchange=()=>{const idx=Number(el.dataset.idx);const field=el.dataset.treasureField;if(!treasureDraft[idx])return;if(field==='text')treasureDraft[idx].text=el.value;else if(field==='choice')treasureDraft[idx].choices[Number(el.dataset.cidx)]=el.value;else if(field==='answer')treasureDraft[idx].answer=Number(el.value);else if(field==='score')treasureDraft[idx].score=Math.max(1,Math.min(50,Number(el.value||5)));};});}
+function collectTreasureQuestions(){if(!treasureEnabledInput?.checked)return [];ensureTreasureDraftCount();return treasureDraft.map(q=>({text:(q.text||'').trim(),choices:(q.choices||[]).map(c=>(c||'').trim()),answer:Number(q.answer||0),score:Number(q.score||5)}));}
+function validateTreasureQuestions(items){if(!treasureEnabledInput?.checked)return true;if(!items.length)return false;return items.every(q=>q.text&&q.choices&&q.choices.length===4&&q.choices.every(Boolean)&&Number.isFinite(q.answer)&&q.answer>=0&&q.answer<4&&Number(q.score)>0);}
+if(treasureEnabledInput)treasureEnabledInput.onchange=renderTreasureEditor;if(treasureCountInput)treasureCountInput.oninput=()=>{ensureTreasureDraftCount();renderTreasureEditor();};renderTreasureEditor();
 function syncModeUI(){const isTeam=gameModeSelect.value==='team';teamCountWrap.style.display=isTeam?'block':'none';modeButtons.forEach(btn=>btn.classList.toggle('active',btn.dataset.mode===gameModeSelect.value));}
 function syncMapUI(){mapButtons.forEach(btn=>btn.classList.toggle('active',btn.dataset.map===mapTypeSelect.value));}
-modeButtons.forEach(btn=>btn.onclick=()=>{gameModeSelect.value=btn.dataset.mode;syncModeUI();});mapButtons.forEach(btn=>btn.onclick=()=>{mapTypeSelect.value=btn.dataset.map;syncMapUI();});
-const treasureEnabledInput=document.getElementById('treasure_enabled');
-const treasureEditor=document.getElementById('treasureEditor');
-const treasureCountInput=document.getElementById('treasure_count');
-const treasureQuestionsBox=document.getElementById('treasureQuestions');
-const treasureBuildBtn=document.getElementById('treasureBuildBtn');
-function treasureChoiceLabel(i){return ['①','②','③','④'][i]||String(i+1);}
-function renderTreasureEditor(count){
-  if(!treasureQuestionsBox)return;
-  const old=[];
-  treasureQuestionsBox.querySelectorAll('.treasureQuestionCard').forEach(card=>{
-    const idx=Number(card.dataset.idx||0);
-    const text=card.querySelector('[data-tfield="text"]')?.value||'';
-    const score=card.querySelector('[data-tfield="score"]')?.value||'2';
-    const answer=Number(card.querySelector('[data-tfield="answer"]:checked')?.value||0);
-    const choices=[...card.querySelectorAll('[data-tfield="choice"]')].map(el=>el.value||'');
-    old[idx]={text,choices,answer,score};
-  });
-  treasureQuestionsBox.innerHTML='';
-  const n=Math.max(1,Math.min(20,Number(count||1)));
-  for(let idx=0;idx<n;idx++){
-    const saved=old[idx]||{text:'',choices:['','','',''],answer:0,score:2};
-    const div=document.createElement('div');
-    div.className='treasureQuestionCard';
-    div.dataset.idx=String(idx);
-    div.innerHTML=`<h4>🎁 보물상자 ${idx+1}</h4><textarea data-tfield="text" placeholder="교사 보물 문제를 입력하세요">${escapeHtml(saved.text||'')}</textarea>${[0,1,2,3].map(i=>`<div class="treasureChoiceRow"><span class="choiceBadge">${treasureChoiceLabel(i)}</span><input data-tfield="choice" value="${escapeHtml(saved.choices[i]||'')}" placeholder="선지 ${i+1}"><label class="answerRadioLabel"><input data-tfield="answer" type="radio" name="treasure_ans_${idx}" value="${i}" ${Number(saved.answer)===i?'checked':''}><span>정답</span></label></div>`).join('')}<div class="treasureScoreRow"><div class="field"><label>보물 점수</label><input data-tfield="score" type="number" min="0" max="100" value="${Number(saved.score||2)}"></div><div class="mini" style="align-self:end;padding-bottom:8px">각 학생이 한 번씩 풀 수 있습니다.</div></div>`;
-    treasureQuestionsBox.appendChild(div);
-  }
-}
-function syncTreasureEditor(){if(!treasureEnabledInput||!treasureEditor)return;treasureEditor.classList.toggle('on',treasureEnabledInput.checked);if(treasureEnabledInput.checked&&!treasureQuestionsBox.children.length)renderTreasureEditor(Number(treasureCountInput?.value||3));}
-if(treasureEnabledInput){treasureEnabledInput.onchange=syncTreasureEditor;}
-if(treasureBuildBtn){treasureBuildBtn.onclick=()=>renderTreasureEditor(Number(treasureCountInput?.value||3));}
-if(treasureCountInput){treasureCountInput.onchange=()=>{if(treasureEnabledInput?.checked)renderTreasureEditor(Number(treasureCountInput.value||3));};}
-syncModeUI();syncMapUI();syncTreasureEditor();
+modeButtons.forEach(btn=>btn.onclick=()=>{gameModeSelect.value=btn.dataset.mode;syncModeUI();});mapButtons.forEach(btn=>btn.onclick=()=>{mapTypeSelect.value=btn.dataset.map;syncMapUI();});syncModeUI();syncMapUI();
 function statusText(s){return s==='countdown'?'시작 대기':s==='running'?'게임 진행 중':s==='finished'?'게임 종료':s==='lobby'?'대기 중':'준비 중'}
 function fmt(sec){sec=Number(sec||0);return `${Math.floor(sec/60)}:${String(sec%60).padStart(2,'0')}`}
 function escapeHtml(value){return String(value??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]))}
@@ -5370,7 +5328,6 @@ function connectTeacherSocket(){
   const rankings=msg.rankings||[];
   const teamRankings=msg.team_rankings||[];
   const battles=msg.battles||[];
-  const treasureProgress=msg.treasure_progress||[];
   const logs=msg.logs||[];
   const teamMode=room.game_mode==='team';
   statusBar.textContent=`[현재상황: ${statusText(msg.game_status)}]`;applyStatusStyle(msg.game_status);updateCeremonyButton(msg.game_status);syncTeacherMusic(msg.game_status);
@@ -5382,12 +5339,11 @@ function connectTeacherSocket(){
   document.getElementById('remainValue').textContent=fmt(msg.remaining_time);
   document.getElementById('teamCountValue').textContent=(msg.team_counts&&msg.team_counts.length?msg.team_counts.map(t=>`${t.team}:${Number(t.count||0)}`).join(' / '):'-');
   document.getElementById('unsubmittedValue').textContent=(Number(msg.unsubmitted_count||0))+'명';
-  roomBox.innerHTML=`<div class='item'><span>방 제목</span><strong>${escapeHtml(room.title||'-')}</strong></div><div class='item'><span>방장</span><strong>${escapeHtml(room.owner||settings.teacher_owner||'-')}</strong></div><div class='item'><span>방 코드</span><strong>${escapeHtml(room.code||'-')}</strong></div><div class='item'><span>게임 모드</span><strong>${teamMode?'팀전':'개인전'}</strong></div>${teamMode?`<div class='item'><span>팀 수</span><strong>${Number(room.team_count||0)||'-'}</strong></div>`:''}<div class='item'><span>맵 종류</span><strong>${escapeHtml(room.map_label||'-')}</strong></div><div class='item'><span>보물상자</span><strong>${settings.treasure_enabled?((msg.treasure_chests||[]).length+'개'):'OFF'}</strong></div><div class='item'><span>배틀 문제 수</span><strong>${Number(settings.question_count||0)}</strong></div><div class='item'><span>제한시간</span><strong>${Number(settings.question_time_limit||0)}초</strong></div><div class='item'><span>점수</span><strong>${Number(settings.score_win||0)}/${Number(settings.score_draw||0)}/${Number(settings.score_lose||0)}</strong></div>`;
+  roomBox.innerHTML=`<div class='item'><span>방 제목</span><strong>${escapeHtml(room.title||'-')}</strong></div><div class='item'><span>방장</span><strong>${escapeHtml(room.owner||settings.teacher_owner||'-')}</strong></div><div class='item'><span>방 코드</span><strong>${escapeHtml(room.code||'-')}</strong></div><div class='item'><span>게임 모드</span><strong>${teamMode?'팀전':'개인전'}</strong></div>${teamMode?`<div class='item'><span>팀 수</span><strong>${Number(room.team_count||0)||'-'}</strong></div>`:''}<div class='item'><span>맵 종류</span><strong>${escapeHtml(room.map_label||'-')}</strong></div><div class='item'><span>보물상자</span><strong>${settings.treasure_enabled?'ON':'OFF'}</strong></div><div class='item'><span>배틀 문제 수</span><strong>${Number(settings.question_count||0)}</strong></div><div class='item'><span>제한시간</span><strong>${Number(settings.question_time_limit||0)}초</strong></div><div class='item'><span>점수</span><strong>${Number(settings.score_win||0)}/${Number(settings.score_draw||0)}/${Number(settings.score_lose||0)}</strong></div>`;
   participantBox.innerHTML=participants.length?participants.map(p=>`<div class='item'><span>${escapeHtml(p.nickname)}${p.team?` (${escapeHtml(p.team)})`:''}</span><strong class='${p.submitted?'submitDone':'submitWait'}'>${p.submitted?'제출 완료':'미제출'}</strong></div>`).join(''):'<div class="mini">아직 참가자가 없습니다.</div>';
   rankingBox.innerHTML=rankings.length?rankings.map(r=>`<div class='item'><span>${Number(r.rank)||'-'}. ${escapeHtml(r.nickname)}${teamMode&&r.team?` (${escapeHtml(r.team)})`:''}</span><strong>${Number(r.score||0)}</strong></div>`).join(''):'<div class="mini">순위 없음</div>';
   teamRankingBox.innerHTML=teamMode?(teamRankings.length?teamRankings.map(r=>`<div class='item'><span>${Number(r.rank)||'-'}. ${escapeHtml(r.team)}팀</span><strong>${Number(r.score||0)}</strong></div>`).join(''):'<div class="mini">팀 순위 없음</div>'):'<div class="mini">개인전 모드</div>';
-  if(treasureProgressBox){treasureProgressBox.innerHTML=treasureProgress.length?treasureProgress.map(t=>`<div class='treasureProgressItem'><span>${escapeHtml(t.label||t.id)} <span class='mini'>+${Number(t.score||0)}점</span></span><strong>${Number(t.attempts||0)}/${Number(t.total_players||0)}명 · 정답 ${Number(t.correct||0)}</strong></div>`).join(''):'<div class="mini">보물상자 문제 OFF</div>'; }
-  battleBox.innerHTML=battles.length?battles.map(b=>`<div class='item'><span>${(b.players||[]).map(escapeHtml).join(' vs ')}</span><strong>${Number(b.progress||0)}/${Number(b.total||0)}</strong></div>`).join(''):'<div class="mini">진행 중인 배틀 없음</div>';
+  battleBox.innerHTML=battles.length?battles.map(b=>`<div class='item'><span>${(b.players||[]).map(escapeHtml).join(' vs ')}</span><strong>${Number(b.progress||0)}/${Number(b.total||0)}</strong></div>`).join(''):'<div class="mini">진행 중인 배틀 없음</div>';if(treasureSummaryBox){const treasures=msg.treasure_summary||[];treasureSummaryBox.innerHTML=treasures.length?treasures.map(t=>`<div class='treasureSummaryItem'><span>🎁 ${Number(t.index)||'-'}번 · ${Number(t.score||0)}점</span><strong>${Number(t.solved_count||0)}/${Number(t.player_count||0)}명 풀이</strong></div>`).join(''):'<div class="mini">보물상자 모드 OFF</div>';};
   logBox.innerHTML=logs.length?logs.slice().reverse().map(l=>`<div class='item'><span>${escapeHtml(l.time)}</span><span>${escapeHtml(l.message)}</span></div>`).join(''):'<div class="mini">로그 없음</div>';
   renderAiReviews(msg.ai_reviews||[], msg.ai_review_meta||{});
   ids.forEach(id=>{const el=document.getElementById(id);if(el&&settings[id]!==undefined&&!editingRoom)el.value=settings[id];});
@@ -5399,7 +5355,37 @@ function connectTeacherSocket(){
 };
   ws.onclose=()=>{if(teacherWs===ws){teacherWs=null;}};
 }
-document.getElementById('createBtn').onclick=async()=>{const btn=document.getElementById('createBtn');btn.disabled=true;btn.textContent='방 생성 중...';const payload={};ids.forEach(id=>{const el=document.getElementById(id);payload[id]=(id==='room_title'||id==='teacher_owner'||id==='game_mode'||id==='map_type')?el.value:Number(el.value);});payload.background_data_url=bgDataUrl||null;payload.treasure_enabled=!!(treasureEnabledInput&&treasureEnabledInput.checked);payload.treasure_questions=[];if(payload.treasure_enabled){document.querySelectorAll('.treasureQuestionCard').forEach(card=>{const qText=card.querySelector('[data-tfield="text"]')?.value||'';const choices=[...card.querySelectorAll('[data-tfield="choice"]')].map(el=>el.value||'');const answer=Number(card.querySelector('[data-tfield="answer"]:checked')?.value||0);const score=Number(card.querySelector('[data-tfield="score"]')?.value||2);payload.treasure_questions.push({text:qText,choices,answer,score});});}editingRoom=false;const res=await fetch('/api/teacher/create_room',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(res.ok){const data=await res.json();if(data.room_code){setTeacherRoomCode(data.room_code);connectTeacherSocket();}showOperate();syncTeacherMusic('lobby',true);}else{editingRoom=true;showCreate();}btn.disabled=false;btn.textContent='방 생성';};
+document.getElementById('createBtn').onclick=async()=>{
+  const btn=document.getElementById('createBtn');
+  btn.disabled=true;btn.textContent='방 생성 중...';
+  const payload={};
+  ids.forEach(id=>{const el=document.getElementById(id);payload[id]=(id==='room_title'||id==='teacher_owner'||id==='game_mode'||id==='map_type')?el.value:Number(el.value);});
+  payload.treasure_enabled=!!treasureEnabledInput?.checked;
+  payload.treasure_count=payload.treasure_enabled?Math.max(1,Math.min(12,Number(treasureCountInput?.value||1))):0;
+  payload.treasure_questions=collectTreasureQuestions();
+  if(payload.treasure_enabled){
+    if(payload.treasure_questions.length!==payload.treasure_count || !validateTreasureQuestions(payload.treasure_questions)){
+      alert(`보물상자 문제 ON 상태에서는 보물 문제 ${payload.treasure_count}개를 모두 입력해야 합니다. 문제, 4개 선택지, 정답, 점수를 확인해주세요.`);
+      btn.disabled=false;btn.textContent='방 생성';return;
+    }
+  }
+  payload.background_data_url=bgDataUrl||null;
+  editingRoom=false;
+  try{
+    const res=await fetch('/api/teacher/create_room',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const data=await res.json().catch(()=>({ok:false,message:'방 생성 실패'}));
+    if(res.ok&&data.ok){
+      if(data.room_code){setTeacherRoomCode(data.room_code);connectTeacherSocket();}
+      showOperate();syncTeacherMusic('lobby',true);
+    }else{
+      alert(data.message||'방 생성 실패');editingRoom=true;showCreate();
+    }
+  }catch(e){
+    alert('방 생성 중 연결 오류가 발생했습니다. 다시 시도해주세요.');editingRoom=true;showCreate();
+  }finally{
+    btn.disabled=false;btn.textContent='방 생성';
+  }
+};
 document.getElementById('startBtn').onclick=()=>{syncTeacherMusic('running',true);return fetch(teacherApi('/api/teacher/start'),{method:'POST'});};
 document.getElementById('endBtn').onclick=()=>{syncTeacherMusic('finished',true);return fetch(teacherApi('/api/teacher/end'),{method:'POST'});};
 document.getElementById('resetBtn').onclick=()=>{syncTeacherMusic('lobby',true);return fetch(teacherApi('/api/teacher/reset'),{method:'POST'});};
@@ -5499,13 +5485,13 @@ function teacherSmoothRenderFrame(now){
 }
 
 function drawWalls(walls){(walls||[]).forEach(w=>{const radius=Math.min(14,Math.min(w.w,w.h)*0.22);const g=ctx.createLinearGradient(w.x,w.y,w.x+w.w,w.y+w.h);g.addColorStop(0,'#7fb6ef');g.addColorStop(.55,'#5d8fda');g.addColorStop(1,'#4d78c6');ctx.save();ctx.shadowColor='rgba(59,130,246,0.18)';ctx.shadowBlur=8;ctx.shadowOffsetY=3;ctx.fillStyle=g;roundRect(w.x,w.y,w.w,w.h,radius,true,false);ctx.restore();ctx.strokeStyle='rgba(255,255,255,.42)';ctx.lineWidth=2;roundRect(w.x,w.y,w.w,w.h,radius,false,true);ctx.fillStyle='rgba(255,255,255,.16)';roundRect(w.x+4,w.y+4,Math.max(8,w.w-8),Math.max(6,Math.min(w.h*0.24,16)),Math.max(4,radius*0.5),true,false);});ctx.lineWidth=1;}
-function renderMap(msg){ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,canvas.width,canvas.height);const hasMaze=(msg.map_walls||[]).length>0;if(bgImage&&bgImage.complete){ctx.drawImage(bgImage,0,0,canvas.width,canvas.height)}else{const bg=ctx.createLinearGradient(0,0,canvas.width,canvas.height);bg.addColorStop(0,'#eaf2ff');bg.addColorStop(.55,'#dbeafe');bg.addColorStop(1,'#cfe2ff');ctx.fillStyle=bg;ctx.fillRect(0,0,canvas.width,canvas.height);ctx.fillStyle='rgba(255,255,255,.30)';ctx.fillRect(14,14,canvas.width-28,canvas.height-28)}ctx.strokeStyle=hasMaze?'rgba(37,99,235,0.08)':'rgba(37,99,235,0.09)';for(let x=0;x<canvas.width;x+=50){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,canvas.height);ctx.stroke()}for(let y=0;y<canvas.height;y+=50){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(canvas.width,y);ctx.stroke()}drawWalls(msg.map_walls||[]);drawTreasures(msg.treasure_chests||[]);(msg.players||[]).forEach(p=>{try{drawPlayer(p)}catch(e){console.warn('teacher drawPlayer failed',e,p);}})}
+function renderMap(msg){ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,canvas.width,canvas.height);const hasMaze=(msg.map_walls||[]).length>0;if(bgImage&&bgImage.complete){ctx.drawImage(bgImage,0,0,canvas.width,canvas.height)}else{const bg=ctx.createLinearGradient(0,0,canvas.width,canvas.height);bg.addColorStop(0,'#eaf2ff');bg.addColorStop(.55,'#dbeafe');bg.addColorStop(1,'#cfe2ff');ctx.fillStyle=bg;ctx.fillRect(0,0,canvas.width,canvas.height);ctx.fillStyle='rgba(255,255,255,.30)';ctx.fillRect(14,14,canvas.width-28,canvas.height-28)}ctx.strokeStyle=hasMaze?'rgba(37,99,235,0.08)':'rgba(37,99,235,0.09)';for(let x=0;x<canvas.width;x+=50){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,canvas.height);ctx.stroke()}for(let y=0;y<canvas.height;y+=50){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(canvas.width,y);ctx.stroke()}drawWalls(msg.map_walls||[]);drawTreasureChests(msg.treasure_chests||[]);(msg.players||[]).forEach(p=>{try{drawPlayer(p)}catch(e){console.warn('teacher drawPlayer failed',e,p);}})}
 function hexToRgb(hex){const clean=(hex||'#60a5fa').replace('#','');const normalized=clean.length===3?clean.split('').map(c=>c+c).join(''):clean;const n=parseInt(normalized,16);return {r:(n>>16)&255,g:(n>>8)&255,b:n&255};}function darkenColor(hex,factor=0.22){const {r,g,b}=hexToRgb(hex);return `rgb(${Math.max(0,Math.floor(r*(1-factor)))},${Math.max(0,Math.floor(g*(1-factor)))},${Math.max(0,Math.floor(b*(1-factor)))})`;}function lightenColor(hex,factor=0.18){const {r,g,b}=hexToRgb(hex);return `rgb(${Math.min(255,Math.floor(r+(255-r)*factor))},${Math.min(255,Math.floor(g+(255-g)*factor))},${Math.min(255,Math.floor(b+(255-b)*factor))})`;}function alphaColor(hex,alpha){const {r,g,b}=hexToRgb(hex);return `rgba(${r},${g},${b},${alpha})`;}
 function normalizeCharacterColor(color){const raw=String(color||'').trim();const cleaned=raw.replace(/[^0-9a-fA-F]/g,'');if(cleaned.length===3){return cleaned.split('').map(ch=>ch+ch).join('').toLowerCase();}if(cleaned.length>=6){return cleaned.slice(0,6).toLowerCase();}return '60a5fa';}
 function buildCharacterSvgUrl(color){return `/character/${normalizeCharacterColor(color)}.svg`; }
 const playerMascotCache={};
 function getPlayerMascot(color){const key=normalizeCharacterColor(color);if(!playerMascotCache[key]){const img=new Image();img.onload=()=>{if(currentState)scheduleTeacherMapRender(currentState);};img.onerror=()=>{playerMascotCache[key]=null;};img.src=buildCharacterSvgUrl(key);playerMascotCache[key]=img;}return playerMascotCache[key];}
-function drawTreasures(chests){(chests||[]).forEach(ch=>{const x=Number(ch.x||0),y=Number(ch.y||0);if(!x&&!y)return;ctx.save();ctx.translate(x,y);ctx.font='30px Arial';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText('🎁',0,0);ctx.font='bold 11px Arial';ctx.fillStyle='#92400e';ctx.fillText('+'+Number(ch.score||0),0,24);ctx.restore();});}
+function drawTreasureChests(chests){(chests||[]).forEach(ch=>{const x=Number(ch.x||0),y=Number(ch.y||0);if(!x||!y)return;ctx.save();ctx.translate(x,y);ctx.shadowColor='rgba(146,64,14,.25)';ctx.shadowBlur=8;ctx.shadowOffsetY=3;ctx.fillStyle='#b45309';ctx.fillRect(-15,-8,30,22);ctx.fillStyle='#fbbf24';ctx.fillRect(-13,-6,26,18);ctx.fillStyle='#92400e';ctx.fillRect(-16,-16,32,12);ctx.fillStyle='#fde68a';ctx.fillRect(-13,-13,26,5);ctx.fillStyle='#78350f';ctx.fillRect(-2,-16,4,34);ctx.fillStyle='#fef3c7';ctx.beginPath();ctx.arc(0,2,4,0,Math.PI*2);ctx.fill();ctx.fillStyle='#78350f';ctx.font='bold 10px Arial';ctx.textAlign='center';ctx.fillText(String(ch.index||''),0,5);ctx.restore();});}
 function drawPlayer(p){const size=30;const bodyColor=p.color||'#60a5fa';const mascot=getPlayerMascot(bodyColor);ctx.save();if(p.state==='battling'){ctx.globalAlpha=0.45}ctx.translate(p.x,p.y);ctx.shadowColor='rgba(15,23,42,0.18)';ctx.shadowBlur=4;ctx.shadowOffsetY=1;if(mascot&&mascot.complete&&mascot.naturalWidth>0){ctx.drawImage(mascot,-size/2,-size/2,size,size);}else{ctx.fillStyle=bodyColor;ctx.beginPath();ctx.arc(0,0,size/2.4,0,Math.PI*2);ctx.fill();}ctx.shadowColor='transparent';if(p.state==='battling'){ctx.beginPath();ctx.arc(0,0,size/2+5.8,0,Math.PI*2);ctx.strokeStyle='rgba(239,68,68,0.85)';ctx.lineWidth=2.2;ctx.stroke();}ctx.restore();ctx.fillStyle='#173b7a';ctx.font='12px Arial';ctx.textAlign='center';const teamLabel=(currentState&&currentState.room&&currentState.room.game_mode==='team'&&p.team)?` [${p.team}]`:'';ctx.fillText(`${p.nickname}${teamLabel}`,p.x,p.y-25)}
 function roundRect(x,y,w,h,r,fill,stroke){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();if(fill)ctx.fill();if(stroke)ctx.stroke()}
 showCreate();

@@ -1327,7 +1327,11 @@ async def start_game(room: str = '') -> JSONResponse:
     state['game_status'] = 'countdown'
     state['game_started_at'] = None
     state['game_end_at'] = None
-    generate_treasure_chests()
+    # v3.41: do not regenerate treasure positions at game start.
+    # Teachers and students can already see the lobby map before starting;
+    # the chests should stay at those visible positions when the game begins.
+    if state['settings'].get('treasure_enabled') and state.get('treasure_questions') and not state.get('treasure_chests'):
+        generate_treasure_chests()
     state['countdown_end_at'] = time.time() + 4
     log('게임 시작 카운트다운')
     await broadcast_state()
@@ -5022,6 +5026,50 @@ button.soft{
 .treasureModeBox{background:linear-gradient(135deg,rgba(20,46,82,.96),rgba(10,27,54,.98))!important;border:1px solid rgba(125,211,252,.36)!important;border-radius:20px!important;padding:16px!important;box-shadow:0 16px 34px rgba(7,18,38,.22),inset 0 1px 0 rgba(255,255,255,.08)!important;color:#eaf7ff!important}
 .treasureModeHeader{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}.treasureSectionLabel{font-size:15px!important;color:#eaf7ff!important;font-weight:1000!important;margin:0 0 6px!important}.treasureModeButtons{display:grid;grid-template-columns:1fr 1fr;gap:10px;min-width:min(380px,100%)}.treasureModeBtn{min-height:48px!important;border-radius:16px!important;border:1px solid rgba(191,219,254,.42)!important;background:linear-gradient(180deg,#f8fbff,#e4effd)!important;color:#123456!important;font-weight:1000!important;font-size:15px!important;box-shadow:0 10px 22px rgba(15,23,42,.12)!important}.treasureModeBtn.active[data-treasure='on']{background:linear-gradient(135deg,#0ea5e9,#2563eb,#4f46e5)!important;color:#fff!important;border-color:rgba(125,211,252,.72)!important;box-shadow:0 14px 32px rgba(37,99,235,.28)!important}.treasureModeBtn.active[data-treasure='off']{background:linear-gradient(180deg,#dbeafe,#bfdbfe)!important;color:#102846!important}.treasureConfig{display:none;margin-top:14px;border-top:1px solid rgba(125,211,252,.22);padding-top:14px}.treasureConfig.active{display:block}.treasureTopRow{display:grid;grid-template-columns:minmax(160px,240px) minmax(0,1fr);gap:12px;align-items:end}.treasureHint{font-size:12px;color:#b9d8f5;font-weight:800;line-height:1.35}.treasureEditor{display:grid;gap:12px;margin-top:12px}.treasureItem{border:1px solid rgba(191,219,254,.28);background:linear-gradient(180deg,rgba(226,241,255,.14),rgba(255,255,255,.07));border-radius:18px;padding:12px;box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}.treasureItemHeader{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;color:#fff;font-weight:1000}.treasureQuestionScoreRow{display:grid;grid-template-columns:minmax(0,1fr) minmax(100px,130px);gap:10px;align-items:stretch}.treasureQuestionInput{min-height:74px!important;resize:vertical;width:100%!important}.treasureScoreBox{display:flex;flex-direction:column;justify-content:flex-end;gap:6px}.treasureScoreBox label{font-size:12px!important;color:#dbeafe!important;font-weight:1000!important}.treasureItem textarea,.treasureItem input,.treasureItem select{background:linear-gradient(180deg,#f8fbff,#e7f1ff)!important;color:#102846!important;border:1px solid #b8d2f0!important;border-radius:14px!important}.treasureChoices{display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px}.treasureChoiceRow{display:grid;grid-template-columns:34px minmax(0,1fr) 92px;align-items:center;gap:8px}.treasureChoiceNo{display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:999px;background:rgba(224,242,254,.18);border:1px solid rgba(186,230,253,.28);color:#eaf7ff;font-weight:1000}.treasureChoiceRow input[type='text']{width:100%!important;min-height:42px!important}.treasureAnswerPick{display:flex!important;align-items:center!important;justify-content:center!important;gap:6px!important;margin:0!important;height:42px!important;border-radius:999px!important;background:rgba(224,242,254,.14)!important;border:1px solid rgba(186,230,253,.35)!important;color:#eaf7ff!important;font-size:12px!important;font-weight:1000!important;white-space:nowrap}.treasureAnswerPick input{width:16px!important;height:16px!important;min-height:auto!important;margin:0!important;accent-color:#38bdf8}.treasureSummaryPanel{border-color:rgba(56,189,248,.28)!important;background:linear-gradient(180deg,rgba(14,165,233,.10),rgba(255,255,255,.055))!important}.treasureSummaryItem{display:flex;justify-content:space-between;gap:8px;align-items:center;padding:8px 10px;border-radius:12px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.10);font-size:12px}.treasureSummaryItem strong{color:#bae6fd}.treasureSummaryItem .mini{font-size:11px;color:#dbeafe}
 @media(max-width:820px){.treasureModeBox{padding:12px!important}.treasureModeHeader{align-items:stretch}.treasureModeButtons{width:100%;min-width:0}.treasureTopRow{grid-template-columns:1fr}.treasureQuestionScoreRow{grid-template-columns:1fr}.treasureChoiceRow{grid-template-columns:30px minmax(0,1fr) 78px;gap:6px}.treasureAnswerPick{font-size:11px!important}}
+
+/* ===== v3.41 treasure editor visual polish ===== */
+.treasureQuestionInput{
+  min-height:92px!important;
+  padding:16px 18px!important;
+  line-height:1.55!important;
+  font-family:Arial,"Malgun Gothic",sans-serif!important;
+  font-size:15px!important;
+  font-weight:800!important;
+  letter-spacing:-.2px!important;
+}
+.treasureChoiceRow input[type='text'],
+.treasureScoreBox input[type='number'],
+#treasure_count{
+  font-family:Arial,"Malgun Gothic",sans-serif!important;
+  font-size:15px!important;
+  font-weight:800!important;
+  padding:11px 14px!important;
+}
+.treasureItem textarea,.treasureItem input[type='text'],.treasureItem input[type='number'],.treasureItem select{
+  background:linear-gradient(180deg,#f8fbff,#e7f1ff)!important;
+  color:#102846!important;
+  border:1px solid #b8d2f0!important;
+  border-radius:14px!important;
+}
+.treasureAnswerPick input[type='radio']{
+  -webkit-appearance:radio!important;
+  appearance:radio!important;
+  width:16px!important;
+  height:16px!important;
+  min-height:0!important;
+  margin:0!important;
+  padding:0!important;
+  border:0!important;
+  border-radius:50%!important;
+  background:transparent!important;
+  box-shadow:none!important;
+  outline:none!important;
+  accent-color:#38bdf8!important;
+}
+.treasureAnswerPick{overflow:hidden!important;}
+@media(max-width:820px){
+  .treasureQuestionInput{min-height:82px!important;padding:14px 15px!important;font-size:14px!important;}
+}
 
 
 /* ===== v3.34 student info compact grid + teacher setup 3-row patch ===== */
